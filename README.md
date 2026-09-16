@@ -12,6 +12,8 @@ results. Nothing leaves your machine except comments you explicitly post.
 
 ![The Triage tab on a GitHub PR](docs/triage-ui.png)
 
+▶ **[Watch the 30-second demo](docs/pr-triage-demo.gif)** — triage → focus review → inline suggested comment → chat.
+
 ## Install
 
 ```bash
