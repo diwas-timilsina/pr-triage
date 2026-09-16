@@ -65,6 +65,40 @@ pr-triage help                                # full reference
 
 Results persist across server restarts in `~/.local/state/pr-triage/store/`.
 
+## Targeting different models
+
+pr-triage never calls a model API itself — it shells out to the `claude` CLI,
+so it works with anything the claude CLI can be pointed at. Pick the model per
+run with `--model` (e.g. `pr-triage serve --model sonnet`); with no flag it
+uses your claude default.
+
+**Claude (native)** — log in once (`claude /login`), or use Bedrock/Vertex via
+the standard `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` env vars.
+pr-triage passes these through untouched.
+
+**OpenAI API models (gpt-4o, o3, …)** — put a translation proxy in front. The
+claude CLI honors `ANTHROPIC_BASE_URL`, and [LiteLLM](https://docs.litellm.ai)
+exposes an Anthropic-compatible `/v1/messages` endpoint backed by your OpenAI
+key:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:4000   # your LiteLLM proxy
+export ANTHROPIC_AUTH_TOKEN=<litellm key>
+pr-triage serve --model gpt-4o
+```
+
+**Local models (Llama, Qwen, gpt-oss, …)** — serve them with
+[LM Studio](https://lmstudio.ai) (or any Anthropic-compatible server) and point
+the same two env vars at it. For slow local models, add
+`--parallel 1 --timeout 1200 --batch-chars 30000`.
+
+Two caveats: the prompts demand strict JSON — output is parsed tolerantly and
+retried once, but small local models sometimes still flunk it (see
+troubleshooting); and triage quality, especially verdicts and drafted
+comments, tracks the model — compare a frontier model against your alternative
+on one real PR before switching your default. The daemon captures its
+environment at startup, so restart `pr-triage serve` after changing backends.
+
 ## Security model
 
 The daemon binds 127.0.0.1 only, validates the Host header (anti DNS-rebind),
