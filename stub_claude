@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Fake `claude` CLI for testing pr-triage. Reads the prompt on stdin, finds
+hunk ids, emits a realistic --output-format json envelope. STUB_MODE controls
+behavior: ok (default) | fenced | prose | missing | notjson | error."""
+import json
+import os
+import re
+import sys
+
+prompt = sys.stdin.read()
+
+if "=== COMMENT ===" in prompt:
+    orig = prompt.split("=== COMMENT ===")[-1].strip()
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                      "result": f"stub reworded, human and simple: {orig[:60]}",
+                      "total_cost_usd": 0.001}))
+    sys.exit(0)
+
+if "=== CONVERSATION ===" in prompt:
+    last = prompt.split("Reviewer:")[-1].split("\n")[0].strip()
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                      "result": f"stub chat reply about: {last[:80]}",
+                      "total_cost_usd": 0.002}))
+    sys.exit(0)
+
+if "second-pass code review" in prompt:
+    review = {
+        "comments": [
+            {"line": 134, "severity": "question",
+             "comment": "stub deep-review comment: is the fallback path still needed?"},
+            {"line": 135, "severity": "nit", "comment": "stub nit: naming."},
+        ],
+        "replies": [{"reply_to_id": 1, "reply": "stub drafted reply to thread 1."}],
+    }
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                      "result": json.dumps(review), "total_cost_usd": 0.004}))
+    sys.exit(0)
+
+ids = re.findall(r"^\[(H\d+n?)\] file:", prompt, re.M)
+mode = os.environ.get("STUB_MODE", "ok")
+
+CATS = ["security", "logic", "error-handling", "config", "test", "docs", "refactor", "style"]
+
+scores = []
+for i, hid in enumerate(ids):
+    n = int(re.sub(r"\D", "", hid))
+    scores.append({
+        "id": hid,
+        "importance": (n * 37) % 101,
+        "category": CATS[n % len(CATS)],
+        "what": [f"stub what A for {hid}", f"stub what B for {hid}"],
+        "why": f"stub why for {hid}: explains the motivation.",
+        "tests": f"stub tests for {hid}: no test changes touch this.",
+        "blast": f"stub blast for {hid}: single module.",
+        "verdict": f"stub impression for {hid}: safe, mechanical.",
+    })
+
+if mode == "missing" and scores:
+    scores = scores[:-1]  # drop last hunk
+
+payload = json.dumps({
+    "tldr": ["stub bullet one: adds SP OAuth credentials",
+             "stub bullet two: enables secrets-sync auth",
+             "stub bullet three: main risk is env var typos"],
+    "impression": ["stub impression: focused change, consistent across envs",
+                   "stub impression: decryption path untested"],
+    "approvability": 82,
+    "approve_signal": "stub signal: approve after confirming staging creds decrypt.",
+    "scores": scores,
+})
+if mode == "fenced":
+    result = "```json\n" + payload + "\n```"
+elif mode == "prose":
+    result = "Here are the scores you asked for:\n\n" + payload + "\n\nLet me know if you need more."
+elif mode == "notjson":
+    # first call returns garbage; retried prompt contains the retry marker -> succeed
+    if "was not valid JSON" in prompt:
+        result = payload
+    else:
+        result = "Sorry, I cannot help with that."
+else:
+    result = payload
+
+envelope = {
+    "type": "result",
+    "subtype": "success",
+    "is_error": mode == "error",
+    "result": "boom: model exploded" if mode == "error" else result,
+    "total_cost_usd": 0.0123,
+    "duration_ms": 1200,
+    "num_turns": 1,
+    "session_id": "stub",
+}
+print(json.dumps(envelope))

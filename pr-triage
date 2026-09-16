@@ -1,0 +1,2472 @@
+#!/usr/bin/env python3
+"""pr-triage — prioritize a GitHub PR's diff for human review using local Claude.
+
+Takes a PR link, fetches the diff via `gh`, asks the locally-configured
+`claude` CLI to score every hunk (0-100 importance, category, one-line
+reason), and prints the diff re-ordered by review priority. Obvious noise
+(lockfiles, generated code, binaries, pure renames, whitespace-only changes)
+is pre-scored heuristically and never sent to the model.
+
+Requires: gh (authenticated), claude CLI. Honors whatever backend your
+shell configures for claude (Anthropic login, ANTHROPIC_BASE_URL -> LM Studio,
+Bedrock, ...). No third-party Python deps.
+
+Examples:
+  pr-triage https://github.com/Nextdoor/dataflow/pull/123
+  pr-triage Nextdoor/dataflow#123 --top 10
+  pr-triage 123 --repo Nextdoor/dataflow --model sonnet --html report.html
+  pr-triage serve                           # start the triage server (dashboard + overlay)
+  pr-triage Nextdoor/dataflow#123 --serve   # triage, then serve (or publish into running server)
+  pr-triage logs -n 50 -f                   # tail the server log
+  pr-triage purge Nextdoor/dataflow#123     # drop one stored triage (omit PR: purge all)
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import dataclasses
+import hashlib
+import html as html_mod
+import http.server
+import json
+import os
+import queue
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Hunk:
+    hid: str                  # "H1", "H2", ...
+    file: str                 # new path (or old path for deletions)
+    file_status: str          # modified | added | deleted | renamed
+    header: str               # "@@ -a,b +c,d @@ ..." line
+    body: str                 # hunk lines incl. header
+    new_start: int = 0
+    new_count: int = 0
+    added: int = 0
+    removed: int = 0
+    # scoring
+    importance: Optional[int] = None
+    category: str = ""
+    reason: str = ""          # compact one-liner (verdict, or heuristic rationale)
+    what: str = ""            # what the change does
+    why: str = ""             # why it is needed in this PR
+    tests: str = ""           # testing/coverage signal for this hunk
+    blast: str = ""           # blast radius if this hunk is wrong
+    verdict: str = ""         # overall impression of the diff
+    heuristic: bool = False   # scored by a local rule, not the model
+
+    @property
+    def line_range(self) -> str:
+        if not self.header:
+            return "meta"
+        if self.new_count:
+            return f"{self.new_start}-{self.new_start + self.new_count - 1}"
+        if self.new_start == 0:
+            return "deleted"
+        return f"after {self.new_start}"
+
+
+@dataclasses.dataclass
+class FileDiff:
+    old_path: str
+    new_path: str
+    is_binary: bool = False
+    is_rename: bool = False
+    is_copy: bool = False
+    is_new: bool = False
+    is_deleted: bool = False
+    old_mode: str = ""
+    new_mode: str = ""
+    hunks: list = dataclasses.field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        if self.is_new:
+            return "added"
+        if self.is_deleted:
+            return "deleted"
+        if self.is_rename:
+            return "renamed"
+        if self.is_copy:
+            return "copied"
+        return "modified"
+
+    @property
+    def display_path(self) -> str:
+        if (self.is_rename or self.is_copy) and self.old_path != self.new_path:
+            return f"{self.old_path} -> {self.new_path}"
+        return self.new_path if not self.is_deleted else self.old_path
+
+
+# ---------------------------------------------------------------------------
+# Terminal colors
+# ---------------------------------------------------------------------------
+
+
+class C:
+    enabled = True
+
+    @classmethod
+    def _c(cls, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if cls.enabled else s
+
+    @classmethod
+    def bold(cls, s): return cls._c("1", s)
+    @classmethod
+    def dim(cls, s): return cls._c("2", s)
+    @classmethod
+    def red(cls, s): return cls._c("31", s)
+    @classmethod
+    def green(cls, s): return cls._c("32", s)
+    @classmethod
+    def yellow(cls, s): return cls._c("33", s)
+    @classmethod
+    def blue(cls, s): return cls._c("34", s)
+    @classmethod
+    def magenta(cls, s): return cls._c("35", s)
+    @classmethod
+    def cyan(cls, s): return cls._c("36", s)
+    @classmethod
+    def bold_red(cls, s): return cls._c("1;31", s)
+    @classmethod
+    def bold_yellow(cls, s): return cls._c("1;33", s)
+    @classmethod
+    def bold_green(cls, s): return cls._c("1;32", s)
+
+
+def score_color(score: Optional[int]):
+    if score is None:
+        return C.dim
+    if score >= 80:
+        return C.bold_red
+    if score >= 60:
+        return C.bold_yellow
+    if score >= 40:
+        return C.cyan
+    return C.dim
+
+
+LOG_PATH = os.path.expanduser("~/.local/state/pr-triage/serve.log")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_log_fh = None
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+    if _log_fh is not None:
+        try:
+            msg = _ANSI_RE.sub("", " ".join(str(a) for a in args))
+            _log_fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+            _log_fh.flush()
+        except OSError:
+            pass
+
+
+def start_log_file():
+    """Tee daemon output (ANSI-stripped, timestamped) to LOG_PATH for `pr-triage logs`."""
+    global _log_fh
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 5 * 1024 * 1024:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+        _log_fh = open(LOG_PATH, "a", encoding="utf-8")
+    except OSError as e:
+        print(f"warning: cannot write serve log {LOG_PATH}: {e}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 1):
+    eprint(C.red(f"pr-triage: {msg}"))
+    sys.exit(code)
+
+
+class ToolError(RuntimeError):
+    """Raisable variant of die() so the serve daemon can report per-PR errors."""
+
+    def __init__(self, msg: str, code: int = 1):
+        super().__init__(msg)
+        self.code = code
+
+
+# ---------------------------------------------------------------------------
+# PR reference parsing + gh
+# ---------------------------------------------------------------------------
+
+PR_URL_RE = re.compile(
+    r"^https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<num>\d+)"
+)
+PR_SHORT_RE = re.compile(r"^(?P<owner>[^/\s]+)/(?P<repo>[^/#\s]+)#(?P<num>\d+)$")
+
+
+PR_PATH_RE = re.compile(r"^/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<num>\d+)")
+
+
+def try_parse_pr_ref(ref: str, repo_flag: Optional[str] = None):
+    """Return (repo 'owner/name', pr_number) or None."""
+    ref = ref.strip()
+    for pat in (PR_URL_RE, PR_SHORT_RE, PR_PATH_RE):
+        m = pat.match(ref)
+        if m:
+            return f"{m.group('owner')}/{m.group('repo')}", int(m.group("num"))
+    if ref.isdigit() and repo_flag:
+        return repo_flag, int(ref)
+    return None
+
+
+def parse_pr_ref(ref: str, repo_flag: Optional[str]):
+    """Return (repo 'owner/name', pr_number), or die with usage help."""
+    got = try_parse_pr_ref(ref, repo_flag)
+    if got:
+        return got
+    if ref.strip().isdigit():
+        die("bare PR number needs --repo OWNER/NAME", 2)
+    die(f"can't parse PR reference: {ref!r}\n"
+        "  expected: https://github.com/owner/repo/pull/N | owner/repo#N | N --repo owner/repo", 2)
+
+
+def canon_pr_key(ref: str) -> Optional[str]:
+    """Canonical store key 'owner/repo#N' for a PR URL / short ref / path."""
+    got = try_parse_pr_ref(ref)
+    return f"{got[0].lower()}#{got[1]}" if got else None
+
+
+def run_gh(args: list, timeout: int = 120) -> str:
+    if not shutil.which("gh"):
+        raise ToolError("`gh` CLI not found on PATH — install it and run `gh auth login`", 3)
+    try:
+        proc = subprocess.run(
+            ["gh"] + args, capture_output=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise ToolError(f"gh {' '.join(args[:3])}... timed out after {timeout}s", 3)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise ToolError(f"gh {' '.join(args[:3])}... failed:\n{err}", 3)
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def fetch_pr(repo: str, num: int):
+    meta_raw = run_gh([
+        "pr", "view", str(num), "--repo", repo, "--json",
+        "number,title,body,url,state,isDraft,baseRefName,headRefName,"
+        "additions,deletions,changedFiles,author",
+    ])
+    try:
+        meta = json.loads(meta_raw)
+    except json.JSONDecodeError:
+        raise ToolError("gh returned unparseable PR metadata", 3)
+    diff = run_gh(["pr", "diff", str(num), "--repo", repo], timeout=300)
+    return meta, diff
+
+
+def fetch_review_comments(repo: str, num: int, warnings: list) -> list:
+    """Best-effort fetch of the PR's diff review comments (threads), slimmed
+    for the overlay's detail view. Failures degrade to an empty list."""
+    try:
+        raw = run_gh(["api", f"repos/{repo}/pulls/{num}/comments?per_page=100"])
+        items = json.loads(raw)
+    except (ToolError, json.JSONDecodeError) as e:
+        warnings.append(f"could not fetch review comments: {str(e)[:120]}")
+        return []
+    if not isinstance(items, list):
+        return []
+    if len(items) == 100:
+        warnings.append("PR has 100+ review comments; only the first 100 are shown in the overlay")
+    out = []
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        out.append({
+            "id": c.get("id"),
+            "reply_to": c.get("in_reply_to_id"),
+            "path": str(c.get("path") or "")[:300],
+            "line": c.get("line") if isinstance(c.get("line"), int) else c.get("original_line"),
+            "user": str((c.get("user") or {}).get("login") or "")[:60],
+            "body": str(c.get("body") or "")[:2000],
+            "created_at": str(c.get("created_at") or "")[:25],
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Unified diff parsing
+# ---------------------------------------------------------------------------
+
+DIFF_GIT_RE = re.compile(r'^diff --git (?:"?a/(?P<a>.*?)"?) (?:"?b/(?P<b>.*?)"?)$')
+HUNK_HEADER_RE = re.compile(
+    r"^@@ -(?P<os>\d+)(?:,(?P<oc>\d+))? \+(?P<ns>\d+)(?:,(?P<nc>\d+))? @@"
+)
+
+
+def unquote_git_path(p: str) -> str:
+    """Decode a git C-quoted path ("caf\\303\\251.py" -> café.py); pass others through."""
+    p = p.strip()
+    if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+        inner = p[1:-1]
+        try:
+            p = (inner.encode("latin1", "backslashreplace")
+                 .decode("unicode_escape")
+                 .encode("latin1")
+                 .decode("utf-8", "replace"))
+        except (UnicodeError, ValueError):
+            p = inner
+    return p
+
+
+def _header_path(line: str, prefix: str) -> Optional[str]:
+    """Extract the authoritative path from a '--- a/x' / '+++ b/x' header line."""
+    val = unquote_git_path(line[4:].rstrip("\t"))
+    if val == "/dev/null":
+        return None
+    if val.startswith(prefix):
+        return val[len(prefix):]
+    return val
+
+
+def parse_diff(diff_text: str) -> list:
+    """Parse a unified diff into FileDiff objects."""
+    files: list = []
+    cur: Optional[FileDiff] = None
+    cur_hunk_lines: Optional[list] = None
+
+    def flush_hunk():
+        nonlocal cur_hunk_lines
+        if cur is not None and cur_hunk_lines:
+            header = cur_hunk_lines[0]
+            m = HUNK_HEADER_RE.match(header)
+            h = Hunk(
+                hid="",  # assigned later
+                file=cur.new_path if not cur.is_deleted else cur.old_path,
+                file_status=cur.status,
+                header=header,
+                body="\n".join(cur_hunk_lines),
+                new_start=int(m.group("ns")) if m else 0,
+                new_count=int(m.group("nc") or "1") if m else 0,
+                added=sum(1 for ln in cur_hunk_lines[1:] if ln.startswith("+")),
+                removed=sum(1 for ln in cur_hunk_lines[1:] if ln.startswith("-")),
+            )
+            cur.hunks.append(h)
+        cur_hunk_lines = None
+
+    # split on \n only: str.splitlines() also breaks on \f/\v/U+2028/... which
+    # occur inside legitimate source lines and would corrupt hunks
+    lines = diff_text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    for raw in lines:
+        line = raw.rstrip("\r")
+        m = DIFF_GIT_RE.match(line)
+        if m:
+            flush_hunk()
+            cur = FileDiff(old_path=unquote_git_path(m.group("a")),
+                           new_path=unquote_git_path(m.group("b")))
+            files.append(cur)
+            continue
+        if cur is None:
+            continue
+        if cur_hunk_lines is None:
+            # file header zone; ---/+++/rename/copy lines carry the authoritative
+            # paths (the `diff --git` line is ambiguous for odd filenames)
+            if line.startswith("Binary files ") or line.startswith("GIT binary patch"):
+                cur.is_binary = True
+            elif line.startswith("rename from "):
+                cur.is_rename = True
+                cur.old_path = unquote_git_path(line[len("rename from "):])
+            elif line.startswith("rename to "):
+                cur.is_rename = True
+                cur.new_path = unquote_git_path(line[len("rename to "):])
+            elif line.startswith("copy from "):
+                cur.is_copy = True
+                cur.old_path = unquote_git_path(line[len("copy from "):])
+            elif line.startswith("copy to "):
+                cur.is_copy = True
+                cur.new_path = unquote_git_path(line[len("copy to "):])
+            elif line.startswith("new file mode"):
+                cur.is_new = True
+            elif line.startswith("deleted file mode"):
+                cur.is_deleted = True
+            elif line.startswith("old mode "):
+                cur.old_mode = line[len("old mode "):].strip()
+            elif line.startswith("new mode "):
+                cur.new_mode = line[len("new mode "):].strip()
+            elif line.startswith("--- "):
+                p = _header_path(line, "a/")
+                if p:
+                    cur.old_path = p
+            elif line.startswith("+++ "):
+                p = _header_path(line, "b/")
+                if p:
+                    cur.new_path = p
+            elif line.startswith("@@"):
+                cur_hunk_lines = [line]
+            continue
+        # inside a hunk
+        if line.startswith("@@"):
+            flush_hunk()
+            cur_hunk_lines = [line]
+        elif line and line[0] in "+- \\":
+            cur_hunk_lines.append(line)
+        elif line == "":
+            # tolerate empty context lines whose leading space was stripped
+            cur_hunk_lines.append(" ")
+        else:
+            # anything else ends the hunk zone (e.g. next file header line)
+            flush_hunk()
+    flush_hunk()
+
+    hid = 0
+    for f in files:
+        for h in f.hunks:
+            hid += 1
+            h.hid = f"H{hid}"
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Heuristic pre-scoring (noise never sent to the model)
+# ---------------------------------------------------------------------------
+
+LOCKFILE_NAMES = {
+    "uv.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "poetry.lock", "cargo.lock", "go.sum", "gemfile.lock", "composer.lock",
+    "flake.lock", "packages.lock.json", "pipfile.lock", "gradle.lockfile",
+}
+GENERATED_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in (
+        r"\.min\.(js|css)$",
+        r"\.(js|css)\.map$",
+        r"_pb2(_grpc)?\.pyi?$",
+        r"\.pb\.go$",
+        r"\.generated\.",
+        r"(^|/)__snapshots__/",
+        r"(^|/)vendor/",
+        r"(^|/)node_modules/",
+        r"(^|/)dist/",
+    )
+]
+
+
+def classify_noise(f: FileDiff) -> Optional[tuple]:
+    """Return (score, category, reason) if this file is auto-scorable noise."""
+    path = (f.new_path or f.old_path or "").lower()
+    base = path.rsplit("/", 1)[-1]
+    if f.is_binary:
+        return 2, "binary", "Binary file change; nothing to line-review."
+    if base in LOCKFILE_NAMES:
+        return 3, "dependency", "Lockfile regenerated from manifest; review the manifest change instead."
+    for pat in GENERATED_PATTERNS:
+        if pat.search(path):
+            return 3, "generated", "Generated/vendored artifact; review the source that produces it."
+    if (f.is_rename or f.is_copy) and not f.hunks:
+        return 4, "refactor", "Pure rename/copy with no content change."
+    return None
+
+
+def is_whitespace_only(h: Hunk) -> bool:
+    """True only for hunks whose +/- lines differ solely in TRAILING whitespace.
+
+    Deliberately conservative: indentation moves, line joins/splits, and
+    whitespace inside string literals all change behavior, so anything beyond
+    trailing whitespace goes to the model. False negatives are cheap here."""
+    adds, rems = [], []
+    for ln in h.body.split("\n")[1:]:
+        if ln.startswith("+"):
+            adds.append(ln[1:].rstrip())
+        elif ln.startswith("-"):
+            rems.append(ln[1:].rstrip())
+    return bool(adds or rems) and adds == rems
+
+
+# ---------------------------------------------------------------------------
+# Claude scoring
+# ---------------------------------------------------------------------------
+
+CATEGORIES = (
+    "security|logic|error-handling|api-contract|data|perf|concurrency|"
+    "config|dependency|build|test|docs|refactor|style|other"
+)
+
+RUBRIC = """Scoring rubric for `importance` (0-100):
+  90-100  security/auth changes, data loss or corruption risk, money paths,
+          core business logic, concurrency/locking, schema or API contract
+          changes with broad blast radius
+  70-89   behavior changes in production code paths, error-handling changes,
+          non-trivial algorithms, performance-sensitive code, migrations
+  40-69   moderate logic, refactors that move behavior, test logic guarding
+          important behavior, build/deploy config with real impact
+  15-39   boilerplate, simple wiring, docs with technical content,
+          low-blast-radius config, test scaffolding
+  0-14    comments/formatting only, import shuffling, renames, generated
+          output, trivial constants"""
+
+MAX_HUNK_PROMPT_CHARS = 4000
+MAX_BODY_CHARS = 1500
+
+
+def truncate_hunk_for_prompt(body: str) -> str:
+    if len(body) <= MAX_HUNK_PROMPT_CHARS:
+        return body
+    head = body[:3000]
+    tail = body[-800:]
+    elided = len(body) - len(head) - len(tail)
+    return f"{head}\n... ({elided} chars elided) ...\n{tail}"
+
+
+def build_prompt(meta: dict, hunks: list) -> str:
+    body = (meta.get("body") or "").strip()
+    if len(body) > MAX_BODY_CHARS:
+        body = body[:MAX_BODY_CHARS] + " ..."
+    parts = [
+        "You are a senior engineer triaging a GitHub pull request for review. "
+        "For each diff hunk below, rate how much human review attention it deserves.",
+        "",
+        f"PR title: {meta.get('title', '')}",
+        f"Branches: {meta.get('headRefName', '?')} -> {meta.get('baseRefName', '?')}",
+        f"PR description:\n{body or '(none)'}",
+        "",
+        RUBRIC,
+        "",
+        "Judge each hunk in the context of the whole PR — a hunk is important if a "
+        "bug or bad design there would matter in production, and unimportant if it "
+        "is mechanical, cosmetic, or fully implied by another hunk.",
+        "",
+        "Respond with JSON only — no markdown fences, no prose — matching exactly:",
+        '{"tldr":["<2-4 bullets, each <=14 words: what the PR does, why, and the main '
+        'risk. Concrete fragments, no fluff, no restating the title>"],'
+        '"impression":["<1-3 bullets: overall take on the WHOLE PR — what is solid, '
+        'what needs attention. Concrete, no fluff>"],'
+        '"approvability":<int 0-100: how close this PR is to approvable as-is — '
+        "90+ approve now, 60-89 approve after small fixes or answered questions, "
+        "<60 needs real work>,"
+        '"approve_signal":"<one terse line: the gating item(s) blocking approval, '
+        'or why it is ready — <=18 words>",'
+        '"scores":[{"id":"H1","importance":<int 0-100>,'
+        f'"category":"<one of: {CATEGORIES}>",'
+        '"what":"<what the change does — terse fragment, or array of 2 short fragments>",'
+        '"why":"<why this change is needed in this PR — terse fragment or 2-fragment array>",'
+        '"tests":"<testing signal for THIS hunk, <=18 words: which test changes in this '
+        "PR cover it ('covered: X_test.py updated'), 'is test code', or "
+        "'no test changes touch this'>\","
+        '"blast":"<blast radius if this hunk is wrong, <=15 words: who/what breaks and '
+        "how wide — e.g. 'all jobs importing this settings module', 'CI lint only', "
+        "'single DAG'>\","
+        '"verdict":"<overall impression, max 25 words: what this change gets right AND '
+        "the one specific thing to fix or double-check if any. Never vague flags like "
+        "'review carefully' — name the actual issue or say plainly why it is fine. "
+        'Not pedantic>"}, ...]}',
+        "Include exactly one entry for every hunk id listed below.",
+        "",
+        "=== HUNKS ===",
+    ]
+    for h in hunks:
+        parts.append("")
+        parts.append(f"[{h.hid}] file: {h.file} ({h.file_status})")
+        parts.append(truncate_hunk_for_prompt(h.body))
+    return "\n".join(parts)
+
+
+def batch_hunks(hunks: list, max_chars: int) -> list:
+    """Group hunks into batches whose prompt bodies stay under max_chars."""
+    batches, cur, cur_size = [], [], 0
+    for h in hunks:
+        size = min(len(h.body), MAX_HUNK_PROMPT_CHARS) + 100
+        if cur and cur_size + size > max_chars:
+            batches.append(cur)
+            cur, cur_size = [], 0
+        cur.append(h)
+        cur_size += size
+    if cur:
+        batches.append(cur)
+    return batches
+
+
+def clean_claude_env() -> dict:
+    """Inherit the environment but drop nested-Claude-session markers that
+    would confuse a child `claude` process when pr-triage itself is run from
+    inside a Claude Code session. Only the session markers are removed — auth
+    and backend selection (CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_BEDROCK,
+    ANTHROPIC_*) pass through untouched."""
+    env = dict(os.environ)
+    for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
+        env.pop(k, None)
+    return env
+
+
+def extract_json(text: str) -> dict:
+    """Pull a JSON object out of model output, tolerating fences and prose.
+
+    Uses raw_decode (string/escape-aware — braces inside string values are
+    fine) at each '{' candidate; prefers an object carrying a 'scores' key."""
+    text = text.strip()
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    dec = json.JSONDecoder()
+    fallback = None
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, _end = dec.raw_decode(text, idx)
+            if isinstance(obj, dict):
+                if "scores" in obj:
+                    return obj
+                if fallback is None:
+                    fallback = obj
+        except (json.JSONDecodeError, RecursionError):
+            pass
+        idx = text.find("{", idx + 1)
+    if fallback is not None:
+        return fallback
+    raise ValueError("no JSON object in model output")
+
+
+class ClaudeError(RuntimeError):
+    pass
+
+
+def run_claude_json(prompt: str, opts, workdir: str) -> tuple:
+    """Run one claude call expected to answer with a JSON object.
+    Returns (payload_dict, cost_usd). Raises ClaudeError/ValueError."""
+    text, cost = run_claude_text(prompt, opts, workdir)
+    return extract_json(text), cost
+
+
+def call_claude(prompt: str, opts, workdir: str) -> tuple:
+    """Run one scoring call. Returns (scores_list, tldr, cost_usd)."""
+    text, cost = run_claude_text(prompt, opts, workdir)
+    payload = extract_json(text)
+    scores = payload.get("scores")
+    if not isinstance(scores, list):
+        raise ValueError("model JSON missing 'scores' list")
+    try:
+        approvability = max(0, min(100, int(payload.get("approvability"))))
+    except (TypeError, ValueError):
+        approvability = None
+    prmeta = {
+        "tldr": norm_note(payload.get("tldr"), cap=900, items=6),
+        "impression": norm_note(payload.get("impression"), cap=900, items=4),
+        "approvability": approvability,
+        "approve_signal": norm_note(payload.get("approve_signal"), cap=300, items=2),
+    }
+    return scores, prmeta, cost
+
+
+def norm_note(v, cap: int = 300, items: int = 4) -> str:
+    """Normalize a model note that may be a string or a list of bullet
+    fragments into a newline-joined string (renderers split on newlines)."""
+    if isinstance(v, list):
+        v = "\n".join(str(x).strip()[:200] for x in v[:items] if str(x).strip())
+    return v.strip()[:cap] if isinstance(v, str) else ""
+
+
+def run_claude_text(prompt: str, opts, workdir: str) -> tuple:
+    cmd = [
+        opts.claude_bin, "-p",
+        "--output-format", "json",
+        "--tools", "",
+        "--safe-mode",
+        "--no-session-persistence",
+    ]
+    if opts.model:
+        cmd += ["--model", opts.model]
+    for extra in opts.claude_arg or []:
+        cmd += shlex.split(extra)
+    try:
+        proc = subprocess.run(
+            cmd, input=prompt.encode("utf-8"), capture_output=True,
+            timeout=opts.timeout, cwd=workdir, env=clean_claude_env(),
+        )
+    except subprocess.TimeoutExpired:
+        raise ClaudeError(f"claude call timed out after {opts.timeout}s "
+                          "(local models can be slow — try --timeout 1200 or a smaller --batch-chars)")
+    except FileNotFoundError:
+        raise ClaudeError(f"claude binary not found: {opts.claude_bin}")
+    except OSError as e:
+        raise ClaudeError(f"cannot execute claude binary {opts.claude_bin}: {e}")
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    stderr = proc.stderr.decode("utf-8", errors="replace")
+    if proc.returncode != 0 and not stdout.strip():
+        raise ClaudeError(f"claude exited {proc.returncode}: {stderr.strip()[:500]}")
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        raise ClaudeError(f"claude did not return a JSON envelope: {stdout.strip()[:300]}")
+    if envelope.get("is_error"):
+        raise ClaudeError(f"claude reported an error: {str(envelope.get('result'))[:300]}")
+    result_text = envelope.get("result") or ""
+    if isinstance(result_text, dict):
+        result_text = json.dumps(result_text)
+    return str(result_text), float(envelope.get("total_cost_usd") or 0.0)
+
+
+def score_batch(batch: list, meta: dict, opts, workdir: str) -> tuple:
+    """Score one batch, retrying once on malformed output. Returns (scores, cost)."""
+    prompt = build_prompt(meta, batch)
+    attempts, last_err = 0, None
+    total_cost = 0.0
+    while attempts < 2:
+        attempts += 1
+        try:
+            scores, prmeta, cost = call_claude(prompt, opts, workdir)
+            return scores, prmeta, total_cost + cost
+        except ClaudeError:
+            raise
+        except (ValueError, json.JSONDecodeError) as e:
+            last_err = e
+            prompt = prompt + (
+                "\n\nIMPORTANT: your previous reply was not valid JSON. "
+                "Reply with ONLY the JSON object described above."
+            )
+    raise ClaudeError(f"model output unparseable after retry: {last_err}")
+
+
+def apply_scores(hunks_by_id: dict, scores: list, warnings: list):
+    for entry in scores:
+        if not isinstance(entry, dict):
+            continue
+        hid = str(entry.get("id", "")).strip()
+        h = hunks_by_id.get(hid)
+        if h is None:
+            warnings.append(f"model returned unknown hunk id {hid!r}; ignored")
+            continue
+        try:
+            imp = int(entry.get("importance"))
+        except (TypeError, ValueError):
+            warnings.append(f"{hid}: non-numeric importance; left unscored")
+            continue
+        h.importance = max(0, min(100, imp))
+        h.category = str(entry.get("category", "other"))[:32] or "other"
+        h.what = norm_note(entry.get("what"))
+        h.why = norm_note(entry.get("why"))
+        h.tests = norm_note(entry.get("tests"))
+        h.blast = norm_note(entry.get("blast"))
+        h.verdict = norm_note(entry.get("verdict"))
+        # compact one-liner for tables/badges; older models may still send "reason"
+        h.reason = (h.verdict.split("\n")[0] if h.verdict else "") \
+            or norm_note(entry.get("reason")) or h.what.split("\n")[0]
+
+
+def prepare_triage(repo: str, num: int, opts):
+    """Fetch and classify a PR. Returns (meta, files, all_hunks, to_score, warnings).
+    Raises ToolError on gh failures."""
+    eprint(C.dim(f"fetching {repo}#{num} via gh ..."))
+    meta, diff_text = fetch_pr(repo, num)
+    files = parse_diff(diff_text)
+
+    warnings: list = []
+    # review-comment threads ride along on meta for the overlay's detail view
+    meta["_triage_comments"] = fetch_review_comments(repo, num, warnings)
+    all_hunks: list = []
+    to_score: list = []
+    for f in files:
+        noise = None if opts.no_heuristics else classify_noise(f)
+        if not f.hunks:
+            # binary / rename / copy / mode-only / empty-file diffs have no text
+            # hunks; synthesize one entry so the file never vanishes from output.
+            # (Must run after classify_noise: its pure-rename rule checks hunks.)
+            if f.old_mode and f.new_mode:
+                detail = f"mode change {f.old_mode} -> {f.new_mode}"
+            else:
+                detail = f"{f.status} with no content change"
+            f.hunks.append(Hunk(
+                hid="", file=f.display_path, file_status=f.status,
+                header="", body=f"(no text diff: {detail} — {f.display_path})",
+            ))
+        if noise is not None:
+            score, cat, reason = noise
+            for h in f.hunks:
+                h.importance, h.category, h.reason, h.heuristic = score, cat, reason, True
+                all_hunks.append(h)
+            continue
+        for h in f.hunks:
+            if not opts.no_heuristics and is_whitespace_only(h):
+                h.importance, h.category, h.heuristic = 5, "style", True
+                h.reason = "Trailing-whitespace-only change."
+                all_hunks.append(h)
+                continue
+            all_hunks.append(h)
+            to_score.append(h)
+
+    # re-assign ids for synthesized hunks
+    for i, h in enumerate(all_hunks, 1):
+        if not h.hid:
+            h.hid = f"H{i}n"
+    return meta, files, all_hunks, to_score, warnings
+
+
+def score_hunks(to_score: list, meta: dict, opts, warnings: list) -> float:
+    """Score hunks with claude, mutating them in place. Returns API cost.
+    Raises ClaudeError on a fatal model/subprocess failure."""
+    if not to_score:
+        eprint(C.dim("all hunks classified heuristically; skipping claude"))
+        return 0.0
+    batches = batch_hunks(to_score, opts.batch_chars)
+    eprint(C.dim(f"scoring {len(to_score)} hunks in {len(batches)} claude call(s) "
+                 f"(model: {opts.model or 'claude default'}) ..."))
+    total_cost = 0.0
+    workdir = tempfile.mkdtemp(prefix="pr-triage-")
+    fatal: Optional[ClaudeError] = None
+    tldrs: dict = {}  # batch index -> pr-level meta; keep the earliest batch's wording
+    try:
+        workers = max(1, min(opts.parallel, len(batches)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(score_batch, b, meta, opts, workdir): i
+                    for i, b in enumerate(batches)}
+            try:
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        scores, prmeta, cost = fut.result()
+                    except ClaudeError as e:
+                        fatal = e
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        break
+                    total_cost += cost
+                    if prmeta.get("tldr") or prmeta.get("impression"):
+                        tldrs[futs[fut]] = prmeta
+                    # score against the batch's own hunks only, so a model
+                    # echoing ids from the prompt example (or another batch)
+                    # can't overwrite unrelated hunks
+                    apply_scores({h.hid: h for h in batches[futs[fut]]}, scores, warnings)
+            except KeyboardInterrupt:
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    if tldrs:
+        best = tldrs[min(tldrs)]
+        meta["_triage_tldr"] = best.get("tldr") or ""
+        meta["_triage_impression"] = best.get("impression") or ""
+        meta["_triage_approvability"] = best.get("approvability")
+        meta["_triage_approve_signal"] = best.get("approve_signal") or ""
+    if fatal is not None:
+        raise fatal
+    missing = [h.hid for h in to_score if h.importance is None]
+    if missing:
+        warnings.append(f"{len(missing)} hunk(s) not scored by the model: {', '.join(missing[:8])}")
+    return total_cost
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def bar(score: Optional[int], width: int = 10) -> str:
+    if score is None:
+        return "?" * width
+    filled = round(score / 100 * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def colorize_diff_line(line: str) -> str:
+    if line.startswith("@@"):
+        return C.cyan(line)
+    if line.startswith("+"):
+        return C.green(line)
+    if line.startswith("-"):
+        return C.red(line)
+    return C.dim(line)
+
+
+def render_terminal(meta: dict, files: list, hunks: list, opts,
+                    elapsed: float, cost: float, warnings: list):
+    width = min(shutil.get_terminal_size((100, 24)).columns, 120)
+    ranked = sorted(hunks, key=lambda h: (-(h.importance if h.importance is not None else -1),
+                                          -(h.added + h.removed)))
+    scored = [h for h in ranked if h.importance is not None]
+    noise = [h for h in ranked if h.heuristic]
+    signal = [h for h in scored if not h.heuristic]
+
+    author = (meta.get("author") or {}).get("login", "?")
+    print()
+    print(C.bold(f"PR #{meta.get('number')} — {meta.get('title', '')}"))
+    print(C.dim(f"{meta.get('url', '')}"))
+    print(C.dim(f"by {author} · {meta.get('headRefName')} -> {meta.get('baseRefName')} · "
+                f"{meta.get('changedFiles')} files · +{meta.get('additions')}/-{meta.get('deletions')}"))
+    tldr = (meta.get("_triage_tldr") or "").strip()
+    if tldr:
+        print()
+        print(C.bold("TL;DR"))
+        for ln in tldr.split("\n"):
+            if ln.strip():
+                print(f"  • {ln.strip()}")
+    impression = (meta.get("_triage_impression") or "").strip()
+    if impression:
+        print(C.bold("IMPRESSION"))
+        for ln in impression.split("\n"):
+            if ln.strip():
+                print(f"  • {ln.strip()}")
+    appr = meta.get("_triage_approvability")
+    if appr is not None:
+        col = C.bold_green if appr >= 80 else (C.bold_yellow if appr >= 55 else C.bold_red)
+        sig = (meta.get("_triage_approve_signal") or "").strip()
+        print(f"{C.bold('APPROVABILITY')} {col(f'{appr}%')}" + (f" — {sig}" if sig else ""))
+    print()
+
+    # ---- summary table (model-scored hunks; heuristic noise grouped below) ----
+    table_hunks = [h for h in ranked if not h.heuristic]
+    print(C.bold("REVIEW PRIORITY"))
+    print(C.dim("─" * width))
+    for i, h in enumerate(table_hunks, 1):
+        col = score_color(h.importance)
+        pct = f"{h.importance:3d}%" if h.importance is not None else "  ??"
+        loc = f"{h.file}:{h.line_range}"
+        cat = f"[{h.category or '?'}]"
+        line1 = f"{i:3d}. {col(bar(h.importance))} {col(pct)}  {C.bold(loc)} {C.magenta(cat)}"
+        print(line1)
+        if h.reason:
+            print(f"     {C.dim(h.reason)}")
+    print()
+
+    # ---- detailed prioritized diff ----
+    detail = [h for h in signal if h.importance is not None and h.importance >= opts.min_score]
+    if opts.top is not None:
+        detail = detail[:max(0, opts.top)]
+    unscored = [h for h in ranked if h.importance is None]
+
+    if detail:
+        print(C.bold("PRIORITIZED DIFF") + C.dim(
+            f"  (top {len(detail)} of {len(hunks)} hunks"
+            + (f", min score {opts.min_score}%" if opts.min_score else "") + ")"))
+        for rank, h in enumerate(detail, 1):
+            col = score_color(h.importance)
+            print()
+            print(C.dim("═" * width))
+            print(f"#{rank} · {col(f'{h.importance}%')} · {C.magenta(h.category)} · "
+                  f"{C.bold(h.file)} {C.dim('(' + h.file_status + ')')}")
+            def note(label, value):
+                lines = [x.strip() for x in value.split("\n") if x.strip()]
+                if not lines:
+                    return
+                print(f"   {C.bold((label + ':').ljust(12))} {lines[0]}")
+                for extra in lines[1:]:
+                    print(f"   {'':<12} • {extra}")
+
+            note("what", h.what)
+            note("why", h.why)
+            note("tests", h.tests)
+            note("blast", h.blast)
+            if h.verdict:
+                lines = [x.strip() for x in h.verdict.split("\n") if x.strip()]
+                print(C.yellow(f"   {'impression:':<12} {lines[0]}"))
+                for extra in lines[1:]:
+                    print(C.yellow(f"   {'':<12} • {extra}"))
+            if not (h.what or h.why or h.verdict) and h.reason:
+                print(C.yellow(f"   note: {h.reason}"))
+            print()
+            for ln in h.body.splitlines():
+                print("  " + colorize_diff_line(ln))
+
+    if unscored:
+        print()
+        print(C.bold_yellow(f"UNSCORED ({len(unscored)} hunks — model skipped them; shown unranked)"))
+        for h in unscored:
+            print(f"  · {h.file}:{h.line_range} ({h.added}+/{h.removed}-)")
+
+    if noise:
+        by_file: dict = {}
+        for h in noise:
+            entry = by_file.setdefault(h.file, [h.importance, h.reason, 0])
+            entry[2] += 1
+        print()
+        print(C.bold(f"LOW-PRIORITY / NOISE ({len(noise)} hunks in {len(by_file)} files, auto-classified)"))
+        for file, (imp, reason, count) in by_file.items():
+            hunks_s = f" ({count} hunks)" if count > 1 else ""
+            print(C.dim(f"  · {imp:2d}% {file}{hunks_s} — {reason}"))
+
+    print()
+    print(C.dim("─" * width))
+    cost_s = f" · api cost ${cost:.4f}" if cost else ""
+    model_s = f" · model {opts.model}" if opts.model else ""
+    print(C.dim(f"scored {len(signal)} hunks with claude, {len(noise)} by heuristics "
+                f"in {elapsed:.1f}s{model_s}{cost_s}"))
+    for w in warnings:
+        eprint(C.yellow(f"warning: {w}"))
+
+
+# ---------------------------------------------------------------------------
+# Reports (JSON / HTML)
+# ---------------------------------------------------------------------------
+
+
+def gh_file_anchor(path: str) -> str:
+    """GitHub 'Files changed' anchor for a file: diff-<sha256 hex of new path>."""
+    if " -> " in path:
+        path = path.split(" -> ")[-1]
+    return "diff-" + hashlib.sha256(path.encode("utf-8")).hexdigest()
+
+
+def gh_hunk_url(pr_url: str, h: Hunk) -> str:
+    """Deep link to this hunk on the real GitHub PR 'Files changed' page."""
+    anchor = gh_file_anchor(h.file)
+    if h.header and h.new_start > 0:
+        anchor += f"R{h.new_start}"
+    return f"{pr_url}/files#{anchor}"
+
+
+def hunk_dict(h: Hunk, pr_url: str = "") -> dict:
+    return {
+        "id": h.hid, "file": h.file, "status": h.file_status,
+        "lines": h.line_range, "added": h.added, "removed": h.removed,
+        "importance": h.importance, "category": h.category,
+        "reason": h.reason, "what": h.what, "why": h.why,
+        "tests": h.tests, "blast": h.blast, "verdict": h.verdict,
+        "heuristic": h.heuristic, "diff": h.body,
+        "anchor": gh_file_anchor(h.file),
+        "gh_url": gh_hunk_url(pr_url, h) if pr_url else "",
+    }
+
+
+def build_report_doc(meta: dict, hunks: list, opts, cost: float) -> dict:
+    ranked = sorted(hunks, key=lambda h: -(h.importance if h.importance is not None else -1))
+    pr_url = meta.get("url") or ""
+    return {
+        "pr": {k: meta.get(k) for k in
+               ("number", "title", "url", "baseRefName", "headRefName",
+                "additions", "deletions", "changedFiles", "state")},
+        "model": opts.model,
+        "api_cost_usd": cost,
+        "tldr": meta.get("_triage_tldr") or "",
+        "impression": meta.get("_triage_impression") or "",
+        "approvability": meta.get("_triage_approvability"),
+        "approve_signal": meta.get("_triage_approve_signal") or "",
+        "comments": meta.get("_triage_comments") or [],
+        "hunks": [hunk_dict(h, pr_url) for h in ranked],
+    }
+
+
+def write_json_report(path: str, meta: dict, hunks: list, opts, cost: float):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(build_report_doc(meta, hunks, opts, cost), fh, indent=2)
+
+
+HTML_TEMPLATE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR triage — __TITLE__</title>
+<style>
+:root { --bg:#fff; --fg:#1a1a1a; --dim:#666; --card:#f6f7f9; --border:#dcdfe4;
+        --add:#0a6e31; --add-bg:#e6f4ea; --del:#c62828; --del-bg:#fdecea;
+        --hot:#c62828; --warm:#b26a00; --mid:#0b6bcb; --cold:#888; --accent:#0b6bcb; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14161a; --fg:#e6e6e6; --dim:#9aa0a6; --card:#1d2025; --border:#33373d;
+          --add:#7ee2a8; --add-bg:#12301d; --del:#ff8a80; --del-bg:#3a1512;
+          --hot:#ff6b6b; --warm:#ffb74d; --mid:#64b5f6; --cold:#777; --accent:#64b5f6; }
+}
+body { background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       max-width:1080px; margin:0 auto; padding:24px 16px; }
+h1 { font-size:20px; margin:0 0 4px; }
+.meta { color:var(--dim); font-size:13px; margin-bottom:16px; }
+.meta a { color:var(--accent); }
+.tldr { background:var(--card); border:1px solid var(--border); border-radius:8px;
+        padding:10px 14px; margin:-6px 0 16px; font-size:14px; }
+.tldr b { margin-right:6px; }
+.toolbar { position:sticky; top:0; z-index:5; background:var(--bg); display:flex; gap:14px;
+           align-items:center; flex-wrap:wrap; padding:10px 0; border-bottom:1px solid var(--border);
+           margin-bottom:8px; font-size:13px; }
+.seg { display:inline-flex; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.seg button { border:0; background:transparent; color:var(--fg); padding:4px 12px; cursor:pointer; font:inherit; }
+.seg button.on { background:var(--accent); color:#fff; }
+.toolbar label { display:inline-flex; gap:6px; align-items:center; color:var(--dim); }
+.toolbar input[type=range] { width:120px; }
+.toolbar .tbtn { border:1px solid var(--border); background:transparent; color:var(--dim);
+                 border-radius:6px; padding:3px 10px; cursor:pointer; font:inherit; }
+#progress { margin-left:auto; color:var(--dim); font-variant-numeric:tabular-nums; }
+.card { background:var(--card); border:1px solid var(--border); border-radius:8px;
+        margin:12px 0; overflow:hidden; }
+.card.reviewed { opacity:.45; }
+.card summary { padding:10px 14px; cursor:pointer; display:flex; gap:10px; align-items:baseline;
+                list-style:none; flex-wrap:wrap; }
+.card summary::-webkit-details-marker { display:none; }
+.rev { align-self:center; }
+.badge { font-weight:700; font-variant-numeric:tabular-nums; min-width:44px; }
+.hot { color:var(--hot); } .warm { color:var(--warm); } .mid { color:var(--mid); } .cold { color:var(--cold); }
+.cat { font-size:12px; border:1px solid var(--border); border-radius:10px; padding:0 8px; color:var(--dim); }
+.gh { font-size:12px; color:var(--accent); text-decoration:none; white-space:nowrap; }
+.gh:hover { text-decoration:underline; }
+.file { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-weight:600; word-break:break-all; }
+.reason { color:var(--dim); font-size:13px; width:100%; margin-left:66px; }
+pre { margin:0; padding:12px 14px; overflow-x:auto; font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+      border-top:1px solid var(--border); }
+.ln-add { color:var(--add); background:var(--add-bg); display:block; }
+.ln-del { color:var(--del); background:var(--del-bg); display:block; }
+.ln-hdr { color:var(--mid); display:block; }
+.ln-ctx { color:var(--dim); display:block; }
+</style></head><body>
+<h1>PR triage — __TITLE__</h1>
+<div class="meta"><a href="__URL__" target="_blank" rel="noopener">__URL__</a> · __BRANCHES__ · __FILES__ files · +__ADDS__/−__DELS____MODEL__</div>
+__TLDR__
+<div class="toolbar">
+  <div class="seg"><button id="b-pri" class="on">Priority</button><button id="b-ord">File order</button></div>
+  <label>min score <input type="range" id="minscore" min="0" max="100" value="0" step="5"><span id="minval">0%</span></label>
+  <label><input type="checkbox" id="shownoise" checked> noise</label>
+  <button class="tbtn" id="expall">expand</button>
+  <button class="tbtn" id="colall">collapse</button>
+  <span id="progress"></span>
+</div>
+<div id="cards">
+__CARDS__
+</div>
+<script>
+(function () {
+  "use strict";
+  var wrap = document.getElementById("cards");
+  var cards = Array.prototype.slice.call(document.querySelectorAll(".card"));
+  var minscore = document.getElementById("minscore");
+  var minval = document.getElementById("minval");
+  var shownoise = document.getElementById("shownoise");
+  var progress = document.getElementById("progress");
+  var bPri = document.getElementById("b-pri");
+  var bOrd = document.getElementById("b-ord");
+  var mode = "pri";
+  var storeKey = "prtriage:" + __PR_KEY__;
+
+  function loadReviewed() {
+    try { return new Set(JSON.parse(localStorage.getItem(storeKey) || "[]")); }
+    catch (e) { return new Set(); }
+  }
+  function saveReviewed(set) {
+    try { localStorage.setItem(storeKey, JSON.stringify(Array.from(set))); } catch (e) {}
+  }
+  var reviewed = loadReviewed();
+
+  function apply() {
+    var min = +minscore.value;
+    minval.textContent = min + "%";
+    cards.slice().sort(function (a, b) {
+      return mode === "pri" ? a.dataset.pri - b.dataset.pri : a.dataset.ord - b.dataset.ord;
+    }).forEach(function (c) { wrap.appendChild(c); });
+    var shown = 0, revShown = 0;
+    cards.forEach(function (c) {
+      var s = +c.dataset.score;
+      var noise = c.dataset.noise === "1";
+      var hide = (noise && !shownoise.checked) || (s >= 0 ? s < min : min > 0);
+      c.style.display = hide ? "none" : "";
+      if (!hide) { shown++; if (reviewed.has(c.dataset.id)) revShown++; }
+    });
+    progress.textContent = revShown + "/" + shown + " reviewed";
+  }
+
+  cards.forEach(function (c) {
+    var cb = c.querySelector(".rev");
+    if (reviewed.has(c.dataset.id)) { cb.checked = true; c.classList.add("reviewed"); }
+    cb.addEventListener("click", function (e) { e.stopPropagation(); });
+    cb.addEventListener("change", function () {
+      if (cb.checked) reviewed.add(c.dataset.id); else reviewed.delete(c.dataset.id);
+      c.classList.toggle("reviewed", cb.checked);
+      saveReviewed(reviewed); apply();
+    });
+  });
+  bPri.addEventListener("click", function () { mode = "pri"; bPri.classList.add("on"); bOrd.classList.remove("on"); apply(); });
+  bOrd.addEventListener("click", function () { mode = "ord"; bOrd.classList.add("on"); bPri.classList.remove("on"); apply(); });
+  minscore.addEventListener("input", apply);
+  shownoise.addEventListener("change", apply);
+  document.getElementById("expall").addEventListener("click", function () {
+    cards.forEach(function (c) { if (c.style.display !== "none") c.open = true; });
+  });
+  document.getElementById("colall").addEventListener("click", function () {
+    cards.forEach(function (c) { c.open = false; });
+  });
+  apply();
+})();
+</script>
+</body></html>
+"""
+
+
+def html_score_class(score: Optional[int]) -> str:
+    if score is None:
+        return "cold"
+    if score >= 80:
+        return "hot"
+    if score >= 60:
+        return "warm"
+    if score >= 40:
+        return "mid"
+    return "cold"
+
+
+def html_diff(body: str) -> str:
+    out = []
+    for ln in body.splitlines():
+        esc = html_mod.escape(ln) or " "
+        if ln.startswith("@@"):
+            out.append(f'<span class="ln-hdr">{esc}</span>')
+        elif ln.startswith("+"):
+            out.append(f'<span class="ln-add">{esc}</span>')
+        elif ln.startswith("-"):
+            out.append(f'<span class="ln-del">{esc}</span>')
+        else:
+            out.append(f'<span class="ln-ctx">{esc}</span>')
+    return "".join(out)
+
+
+def stable_hid(h: Hunk) -> str:
+    """Content-derived id for reviewed-state persistence: survives re-runs and
+    goes stale (correctly) when the hunk's content changes on a new push."""
+    digest = hashlib.sha1(
+        f"{h.file}\n{h.header}\n{h.body}".encode("utf-8", "replace")).hexdigest()
+    return "h" + digest[:12]
+
+
+def _html_card(h: Hunk, pr_url: str, pri: int, ord_idx: int, body: str,
+               file_label: str, is_noise: bool) -> str:
+    pct = f"{h.importance}%" if h.importance is not None else "??"
+    cls = html_score_class(h.importance)
+    open_attr = " open" if (h.importance or 0) >= 70 and not is_noise else ""
+    score = h.importance if h.importance is not None else -1
+    gh = ""
+    if pr_url:
+        gh = (f'<a class="gh" href="{html_mod.escape(gh_hunk_url(pr_url, h))}" '
+              f'target="_blank" rel="noopener">GitHub &#8599;</a>')
+    notes = "".join(
+        f'<span class="reason"><b>{label}</b> {html_mod.escape(text.replace(chr(10), " • "))}</span>'
+        for label, text in (("what", h.what), ("why", h.why), ("tests", h.tests),
+                            ("blast", h.blast), ("impression", h.verdict)) if text
+    ) or (f'<span class="reason">{html_mod.escape(h.reason)}</span>' if h.reason else "")
+    return (
+        f'<details class="card"{open_attr} data-id="{stable_hid(h)}" '
+        f'data-score="{score}" data-noise="{1 if is_noise else 0}" '
+        f'data-pri="{pri}" data-ord="{ord_idx}"><summary>'
+        f'<input type="checkbox" class="rev" title="mark reviewed">'
+        f'<span class="badge {cls}">{pct}</span>'
+        f'<span class="file">{html_mod.escape(file_label)}</span>'
+        f'<span class="cat">{html_mod.escape(h.category or "?")}</span>'
+        f"{gh}{notes}"
+        f"</summary><pre>{html_diff(body)}</pre></details>"
+    )
+
+
+def render_html(meta: dict, hunks: list, opts) -> str:
+    pr_url = meta.get("url") or ""
+    ranked = sorted(hunks, key=lambda h: -(h.importance if h.importance is not None else -1))
+    ord_of = {id(h): i for i, h in enumerate(hunks)}  # file order = discovery order
+    signal = [h for h in ranked if not h.heuristic]
+    noise = [h for h in ranked if h.heuristic]
+    cards, pri = [], 0
+    for h in signal:
+        cards.append(_html_card(h, pr_url, pri, ord_of[id(h)],
+                                h.body, f"{h.file}:{h.line_range}", False))
+        pri += 1
+    by_file: dict = {}
+    for h in noise:
+        by_file.setdefault(h.file, []).append(h)
+    for file, hs in by_file.items():
+        h0 = hs[0]
+        count_s = f" · {len(hs)} hunks" if len(hs) > 1 else ""
+        cards.append(_html_card(h0, pr_url, pri, ord_of[id(h0)],
+                                "\n".join(h.body for h in hs), f"{file}{count_s}", True))
+        pri += 1
+    subs = {
+        "__TITLE__": html_mod.escape(f"#{meta.get('number')} {meta.get('title', '')}"),
+        "__URL__": html_mod.escape(pr_url),
+        "__BRANCHES__": html_mod.escape(f"{meta.get('headRefName')} → {meta.get('baseRefName')}"),
+        "__FILES__": html_mod.escape(str(meta.get("changedFiles"))),
+        "__ADDS__": html_mod.escape(str(meta.get("additions"))),
+        "__DELS__": html_mod.escape(str(meta.get("deletions"))),
+        "__MODEL__": html_mod.escape(f" · {opts.model}" if opts.model else ""),
+        "__TLDR__": (('<div class="tldr"><b>TL;DR</b>'
+                      + "".join(f"<div>• {html_mod.escape(ln.strip())}</div>"
+                                for ln in (meta.get("_triage_tldr") or "").split("\n")
+                                if ln.strip())
+                      + "</div>")
+                     if meta.get("_triage_tldr") else ""),
+        "__PR_KEY__": json.dumps(pr_url or f"pr-{meta.get('number')}").replace("<", "\\u003c"),
+        "__CARDS__": "\n".join(cards),
+    }
+    # single pass: a token smuggled inside a value (e.g. a PR titled __CARDS__)
+    # is emitted literally instead of being expanded by a later replacement
+    return re.sub("|".join(map(re.escape, subs)), lambda m: subs[m.group(0)], HTML_TEMPLATE)
+
+
+def write_html_report(path: str, meta: dict, hunks: list, opts):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(render_html(meta, hunks, opts))
+
+
+# ---------------------------------------------------------------------------
+# Serve mode: a long-running local daemon holding triage results for many PRs.
+# Feeds the GitHub-overlay userscript, hosts HTML reports, and accepts new PRs
+# from its index page, from the overlay's "Triage this PR" button, and from
+# `pr-triage <pr> --serve` runs (which publish into it instead of conflicting).
+# ---------------------------------------------------------------------------
+
+SERVE_STATE_PATH = os.path.expanduser("~/.local/state/pr-triage/serve.json")
+STORE_DIR = os.path.expanduser("~/.local/state/pr-triage/store")
+
+
+def _persist_path(key: str) -> str:
+    return os.path.join(STORE_DIR, urllib.parse.quote(key, safe="") + ".json")
+
+
+def persist_entry(key: str, entry: dict):
+    """Write a finished triage to the local datastore (atomic, private)."""
+    try:
+        os.makedirs(STORE_DIR, exist_ok=True)
+        done_reviews = {k: v for k, v in (entry.get("reviews") or {}).items()
+                        if isinstance(v, dict) and v.get("status") == "done"}
+        doc = {"key": key, "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+               "title": entry.get("title", ""), "url": entry.get("url", ""),
+               "hunks": entry.get("hunks", 0), "reviews": done_reviews,
+               "payload": entry.get("payload"), "html": entry.get("html", "")}
+        path = _persist_path(key)
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        eprint(C.yellow(f"warning: could not persist triage of {key}: {e}"))
+
+
+def delete_persisted(key: str):
+    try:
+        os.remove(_persist_path(key))
+    except OSError:
+        pass
+
+
+def load_persisted() -> list:
+    """Read saved triages, oldest first (so cap-eviction drops the oldest)."""
+    try:
+        names = [n for n in os.listdir(STORE_DIR) if n.endswith(".json")]
+    except OSError:
+        return []
+    files = []
+    for n in names:
+        path = os.path.join(STORE_DIR, n)
+        try:
+            files.append((os.path.getmtime(path), path))
+        except OSError:
+            continue
+    out = []
+    for _, path in sorted(files):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            key = canon_pr_key(str(doc.get("key", "")))
+            payload = doc.get("payload")
+            if not key or not isinstance(payload, dict) or not isinstance(doc.get("html"), str):
+                continue
+            reviews = doc.get("reviews")
+            out.append((key, {"status": "done", "title": str(doc.get("title") or ""),
+                              "url": str(doc.get("url") or ""),
+                              "hunks": int(doc.get("hunks") or 0),
+                              "reviews": reviews if isinstance(reviews, dict) else {},
+                              "payload": payload, "html": doc["html"], "error": "",
+                              "saved": str(doc.get("saved_at") or "")}))
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            eprint(C.yellow(f"warning: skipping corrupt triage store file {path}"))
+    return out
+
+
+def read_serve_state() -> Optional[dict]:
+    try:
+        with open(SERVE_STATE_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def write_serve_state(state: dict):
+    os.makedirs(os.path.dirname(SERVE_STATE_PATH), exist_ok=True)
+    fd = os.open(SERVE_STATE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def build_review_prompt(payload: dict, hunk: dict, file_threads: list) -> str:
+    """Prompt for the on-demand deep review of a single hunk."""
+    pr = payload.get("pr") or {}
+    parts = [
+        "You are doing a careful second-pass code review of ONE diff hunk from a "
+        "GitHub pull request. Draft ONLY feedback genuinely worth raising — real "
+        "bugs, risks, missing tests, unclear intent. If nothing is worth raising, "
+        "return empty lists. Never invent praise or filler comments.",
+        "",
+        f"PR: {pr.get('title', '')}",
+        f"PR summary: {payload.get('tldr') or '(none)'}",
+        f"File: {hunk.get('file')} (lines {hunk.get('lines')})",
+        f"Triage notes — what: {hunk.get('what') or '-'} | why: {hunk.get('why') or '-'} "
+        f"| tests: {hunk.get('tests') or '-'} | blast: {hunk.get('blast') or '-'} "
+        f"| impression: {hunk.get('verdict') or hunk.get('reason') or '-'}",
+        "",
+        "=== DIFF ===",
+        str(hunk.get("diff") or "")[:20000],
+    ]
+    if file_threads:
+        parts += ["", "=== EXISTING REVIEW THREADS ON THIS FILE (id · line · author · text) ==="]
+        for c in file_threads[:40]:
+            tag = f"(reply to {c['reply_to']})" if c.get("reply_to") else f"[id {c.get('id')}]"
+            parts.append(f"{tag} line {c.get('line')} · {c.get('user')}: {str(c.get('body'))[:500]}")
+    parts += [
+        "",
+        "Respond with JSON only — no markdown fences, no prose — matching exactly:",
+        '{"comments":[{"line":<int, NEW-file line number inside this hunk>,'
+        '"severity":"blocker|question|suggestion|nit",'
+        '"comment":"<the review comment, specific and concise>"}],'
+        '"replies":[{"reply_to_id":<int, id of the thread root comment>,'
+        '"reply":"<draft reply — ONLY for threads whose latest message asks something '
+        'or where new information warrants a response>"}]}',
+    ]
+    return "\n".join(parts)
+
+
+def build_chat_prompt(payload: dict, hunk: Optional[dict], file_threads: list,
+                      messages: list) -> str:
+    """Prompt for the reviewer chat — whole-PR context, or one hunk in focus."""
+    pr = payload.get("pr") or {}
+    parts = [
+        "You are a code-review assistant chatting with a human reviewer about a "
+        "GitHub pull request. Answer the reviewer's last message directly and "
+        "concisely, in plain text (no markdown headings, no bullet spam). Ground "
+        "every claim in the provided context; when something is outside it, say so "
+        "plainly instead of guessing.",
+        "",
+        f"PR: {pr.get('title', '')} ({pr.get('url', '')})",
+        f"Summary: {payload.get('tldr') or '(none)'}",
+    ]
+    if hunk is not None:
+        parts += [
+            "",
+            f"FOCUS DIFF — {hunk.get('file')}:{hunk.get('lines')} "
+            f"(importance {hunk.get('importance')}%, {hunk.get('category')})",
+            f"what: {hunk.get('what') or '-'} | why: {hunk.get('why') or '-'} | "
+            f"tests: {hunk.get('tests') or '-'} | blast: {hunk.get('blast') or '-'} | "
+            f"impression: {hunk.get('verdict') or hunk.get('reason') or '-'}",
+            "=== DIFF ===",
+            str(hunk.get("diff") or "")[:20000],
+        ]
+        if file_threads:
+            parts += ["", "=== REVIEW THREADS ON THIS FILE ==="]
+            for c in file_threads[:30]:
+                parts.append(f"line {c.get('line')} · {c.get('user')}: {str(c.get('body'))[:400]}")
+    else:
+        scored = [h for h in payload.get("hunks", []) if not h.get("heuristic")]
+        parts += ["", "=== CHANGES BY PRIORITY (score · file:lines · verdict) ==="]
+        for h in scored[:150]:
+            parts.append(f"{h.get('importance')}% · {h.get('file')}:{h.get('lines')} · "
+                         f"{(h.get('verdict') or h.get('reason') or '')[:120]}")
+        parts += ["", "=== TOP DIFF EXCERPTS ==="]
+        for h in scored[:8]:
+            parts += [f"--- {h.get('file')}:{h.get('lines')}",
+                      str(h.get("diff") or "")[:2500]]
+    parts += ["", "=== CONVERSATION ==="]
+    for m in messages[-20:]:
+        role = "Reviewer" if m.get("role") == "user" else "Assistant"
+        parts.append(f"{role}: {str(m.get('text'))[:4000]}")
+    parts += ["", "Reply to the reviewer's last message. Plain text only — no JSON."]
+    return "\n".join(parts)
+
+
+def slim_review(payload: dict) -> dict:
+    """Validate/trim a model deep-review response."""
+    comments, replies = [], []
+    for c in (payload.get("comments") or [])[:10]:
+        if not isinstance(c, dict):
+            continue
+        try:
+            line = int(c.get("line"))
+        except (TypeError, ValueError):
+            line = 0
+        sev = str(c.get("severity") or "suggestion")
+        if sev not in ("blocker", "question", "suggestion", "nit"):
+            sev = "suggestion"
+        text = str(c.get("comment") or "").strip()[:1000]
+        if text:
+            comments.append({"line": line, "severity": sev, "comment": text})
+    for r in (payload.get("replies") or [])[:10]:
+        if not isinstance(r, dict):
+            continue
+        try:
+            rid = int(r.get("reply_to_id"))
+        except (TypeError, ValueError):
+            continue
+        text = str(r.get("reply") or "").strip()[:1000]
+        if text:
+            replies.append({"reply_to_id": rid, "reply": text})
+    return {"comments": comments, "replies": replies}
+
+
+INDEX_TEMPLATE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pr-triage server</title>
+<style>
+:root { --bg:#fff; --fg:#1a1a1a; --dim:#666; --card:#f6f7f9; --border:#dcdfe4; --accent:#0b6bcb;
+        --hot:#c62828; --ok:#0a6e31; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#14161a; --fg:#e6e6e6; --dim:#9aa0a6; --card:#1d2025; --border:#33373d; --accent:#64b5f6;
+          --hot:#ff6b6b; --ok:#7ee2a8; }
+}
+body { background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;
+       max-width:860px; margin:0 auto; padding:28px 16px; }
+h1 { font-size:19px; margin:0 0 14px; }
+form { display:flex; gap:8px; margin-bottom:20px; }
+input[type=text] { flex:1; padding:7px 10px; border:1px solid var(--border); border-radius:6px;
+                   background:var(--card); color:var(--fg); font:inherit; }
+button { padding:7px 16px; border:0; border-radius:6px; background:var(--accent); color:#fff;
+         font:inherit; cursor:pointer; }
+#msg { color:var(--dim); font-size:13px; margin:-12px 0 16px; min-height:18px; }
+.row { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:10px 14px;
+       margin:8px 0; display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
+.key { font-family:ui-monospace,Menlo,monospace; font-weight:600; }
+.st { font-size:12px; border-radius:10px; padding:0 8px; border:1px solid var(--border); color:var(--dim); }
+.st.done { color:var(--ok); } .st.error { color:var(--hot); } .st.running,.st.queued { color:var(--accent); }
+.title { color:var(--dim); flex:1; min-width:200px; }
+a { color:var(--accent); text-decoration:none; } a:hover { text-decoration:underline; }
+.hint { color:var(--dim); font-size:13px; margin-top:24px; }
+</style></head><body>
+<h1>pr-triage server</h1>
+<form onsubmit="add(); return false;">
+  <input type="text" id="pr" placeholder="https://github.com/owner/repo/pull/123 or owner/repo#123">
+  <button>Triage</button>
+</form>
+<div id="msg"></div>
+__ROWS__
+<div class="hint">Overlay userscript reads this server. Triage from here, from the button the
+overlay shows on untriaged PRs, or with <code>pr-triage &lt;pr&gt; --serve</code>. Ctrl-C the
+<code>pr-triage serve</code> process to stop.</div>
+<script>
+async function add() {
+  var v = document.getElementById("pr").value.trim();
+  if (!v) return;
+  try {
+    var r = await fetch("/triage", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-PR-Triage": "1" },
+      body: JSON.stringify({ pr: v }) });
+    var j = await r.json();
+    document.getElementById("msg").textContent = j.error || ("status: " + j.status);
+    if (r.ok) setTimeout(function () { location.reload(); }, 900);
+  } catch (e) { document.getElementById("msg").textContent = "request failed: " + e; }
+}
+if (document.querySelector("[data-live]")) setInterval(function () {
+  var p = document.getElementById("pr");
+  if (!p.value && document.activeElement !== p) location.reload();
+}, 4000);
+</script>
+</body></html>
+"""
+
+
+def build_index_html(entries: list) -> str:
+    rows = []
+    for e in entries:
+        st = e["status"]
+        live = ' data-live="1"' if st in ("queued", "running") else ""
+        links = ""
+        if st == "done":
+            saved = f'<span class="st">{html_mod.escape(e.get("saved") or "")}</span>' if e.get("saved") else ""
+            links = (f'<a href="/report?pr={urllib.parse.quote(e["key"])}">report</a> '
+                     f'<a href="{html_mod.escape(e["url"])}/files" target="_blank" rel="noopener">github</a>'
+                     f'<span class="st">{e["hunks"]} hunks</span>{saved}')
+        err = f'<span class="title">{html_mod.escape(e.get("error") or "")}</span>' if st == "error" else ""
+        rows.append(
+            f'<div class="row"{live}><span class="st {st}">{st}</span>'
+            f'<span class="key">{html_mod.escape(e["key"])}</span>'
+            f'<span class="title">{html_mod.escape(e.get("title") or "")}</span>{err}{links}</div>'
+        )
+    if not rows:
+        rows.append('<div class="row"><span class="title">nothing triaged yet — add a PR above</span></div>')
+    return INDEX_TEMPLATE.replace("__ROWS__", "\n".join(rows))
+
+
+def daemon_serve(port: int, opts, seeds: list):
+    """Run the triage server. seeds: list of (key, payload, html) already scored."""
+    store: dict = {}      # key -> {status, title, url, hunks, payload, html, error}
+    lock = threading.Lock()
+    jobs: queue.Queue = queue.Queue(maxsize=32)
+    token = secrets.token_hex(16)
+    MAX_STORE = 50
+
+    def evict_locked():
+        # caller holds `lock`: drop oldest finished entries beyond the cap
+        while len(store) > MAX_STORE:
+            victim = next((k for k, v in store.items()
+                           if v["status"] in ("done", "error")), None)
+            if victim is None:
+                break
+            del store[victim]
+            delete_persisted(victim)
+
+    for key, payload, html_doc in seeds:
+        store[key] = {"status": "done", "title": payload["pr"].get("title") or "",
+                      "url": payload["pr"].get("url") or "", "hunks": len(payload["hunks"]),
+                      "payload": payload, "html": html_doc, "error": "",
+                      "saved": time.strftime("%Y-%m-%d %H:%M")}
+        persist_entry(key, store[key])
+
+    restored = 0
+    for key, entry in load_persisted():
+        if key not in store:
+            store[key] = entry
+            restored += 1
+    evict_locked()
+    if restored:
+        eprint(C.dim(f"restored {restored} saved triage(s) from {STORE_DIR}"))
+
+    def worker():
+        while True:
+            key, repo, num = jobs.get()
+            try:
+                meta, files, all_hunks, to_score, warnings = prepare_triage(repo, num, opts)
+                with lock:
+                    store[key]["status"] = "running"
+                    store[key]["title"] = meta.get("title") or ""
+                    store[key]["url"] = meta.get("url") or ""
+                cost = score_hunks(to_score, meta, opts, warnings)
+                payload = build_report_doc(meta, all_hunks, opts, cost)
+                html_doc = render_html(meta, all_hunks, opts)
+                with lock:
+                    store[key].update(status="done", payload=payload, html=html_doc,
+                                      hunks=len(payload["hunks"]), error="",
+                                      saved=time.strftime("%Y-%m-%d %H:%M"))
+                    persist_entry(key, store[key])
+                eprint(C.bold_green(f"triaged {key}: {len(payload['hunks'])} hunks, ${cost:.4f}"))
+                auto_review(key)
+            except Exception as e:  # daemon must survive any per-PR failure
+                with lock:
+                    store[key].update(status="error", error=str(e)[:500])
+                eprint(C.red(f"triage of {key} failed: {str(e)[:200]}"))
+
+    review_sem = threading.Semaphore(2)
+
+    def review_job(key: str, hid: str):
+        with review_sem:
+            with lock:
+                entry = store.get(key)
+                if not entry or entry.get("status") != "done":
+                    return
+                hunk = next((h for h in entry["payload"]["hunks"] if h.get("id") == hid), None)
+                if hunk is None:
+                    entry.setdefault("reviews", {})[hid] = {"status": "error", "error": "unknown hunk"}
+                    return
+                file_threads = [c for c in (entry["payload"].get("comments") or [])
+                                if c.get("path") == hunk.get("file")]
+                prompt = build_review_prompt(entry["payload"], hunk, file_threads)
+            workdir = tempfile.mkdtemp(prefix="pr-triage-review-")
+            try:
+                payload, cost = run_claude_json(prompt, opts, workdir)
+                result = slim_review(payload)
+                result["status"] = "done"
+                with lock:
+                    entry = store.get(key)
+                    if entry:
+                        entry.setdefault("reviews", {})[hid] = result
+                        persist_entry(key, entry)
+                eprint(C.bold_green(
+                    f"deep review {key} {hid}: {len(result['comments'])} comment(s), "
+                    f"{len(result['replies'])} reply draft(s), ${cost:.4f}"))
+            except Exception as e:  # daemon must survive any per-review failure
+                with lock:
+                    entry = store.get(key)
+                    if entry:
+                        entry.setdefault("reviews", {})[hid] = {
+                            "status": "error", "error": str(e)[:300]}
+                eprint(C.red(f"deep review of {key} {hid} failed: {str(e)[:200]}"))
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+    def auto_review(key: str):
+        """Pre-generate deep reviews for the top-scoring hunks right after a
+        triage lands, so 'Review this diff' is an instant read for them."""
+        if getattr(opts, "auto_review", 0) <= 0:
+            return
+        with lock:
+            entry = store.get(key)
+            if not entry or entry["status"] != "done":
+                return
+            hunks = [h for h in entry["payload"]["hunks"]
+                     if not h.get("heuristic") and h.get("id")
+                     and isinstance(h.get("importance"), int)
+                     and h["importance"] >= opts.auto_review_min]
+            hunks.sort(key=lambda x: -x["importance"])
+            reviews = entry.setdefault("reviews", {})
+            todo = []
+            for h in hunks[:opts.auto_review]:
+                cur = reviews.get(h["id"])
+                if cur and cur.get("status") in ("queued", "running", "done"):
+                    continue
+                reviews[h["id"]] = {"status": "running"}
+                todo.append(h["id"])
+        for hid in todo:
+            threading.Thread(target=review_job, args=(key, hid), daemon=True).start()
+        if todo:
+            eprint(C.dim(f"auto-reviewing {len(todo)} hunk(s) ≥{opts.auto_review_min}% on {key}"))
+
+    def entry_for(pr_param: str) -> Optional[dict]:
+        key = canon_pr_key(pr_param) if pr_param else None
+        with lock:
+            if key and key in store:
+                return dict(store[key], key=key)
+            if not pr_param:
+                done = [(k, v) for k, v in store.items() if v["status"] == "done"]
+                if len(done) == 1:
+                    return dict(done[0][1], key=done[0][0])
+        return None
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        # Payloads are full PR diffs (possibly private source): CORS is granted
+        # ONLY to github.com; everything else can't read responses cross-origin.
+        # POST /triage additionally requires the X-PR-Triage header, so a random
+        # website can never trigger a triage (custom header -> CORS preflight,
+        # which only github.com passes). POST /publish requires the daemon token
+        # from the 0600 state file, which no web page can read.
+        def _cors(self):
+            origin = self.headers.get("Origin", "")
+            if origin == "https://github.com":
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-PR-Triage")
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Vary", "Origin")
+
+        def _host_ok(self) -> bool:
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+            return host in ("127.0.0.1", "localhost", "")
+
+        def _send(self, code: int, ctype: str, body: bytes):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, code: int, obj: dict):
+            self._send(code, "application/json; charset=utf-8",
+                       json.dumps(obj).encode("utf-8"))
+
+        def _body(self, cap: int) -> Optional[dict]:
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                if n <= 0 or n > cap:
+                    return None
+                parsed = json.loads(self.rfile.read(n).decode("utf-8", errors="replace"))
+                return parsed if isinstance(parsed, dict) else None
+            except (ValueError, OSError):
+                return None
+
+        def _query(self) -> dict:
+            return dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query))
+
+        def do_OPTIONS(self):
+            if not self._host_ok():
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+
+        def do_GET(self):
+            if not self._host_ok():
+                self._send(403, "text/plain; charset=utf-8", b"forbidden")
+                return
+            path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
+            if path == "/health":
+                self._json(200, {"app": "pr-triage", "port": port})
+            elif path == "/triage.json":
+                entry = entry_for(self._query().get("pr", ""))
+                if entry and entry["status"] == "done":
+                    # deep-review results ride along so a reloaded page can
+                    # hydrate finished/in-flight reviews instead of losing them
+                    body = dict(entry["payload"])
+                    with lock:
+                        raw = (store.get(entry["key"]) or {}).get("reviews") or {}
+                        body["reviews"] = {k: dict(v) for k, v in raw.items()
+                                           if isinstance(v, dict)
+                                           and v.get("status") in ("done", "running")}
+                    self._json(200, body)
+                elif entry:
+                    self._json(404, {"status": entry["status"], "error": entry.get("error") or ""})
+                else:
+                    self._json(404, {"status": "absent"})
+            elif path == "/status":
+                entry = entry_for(self._query().get("pr", ""))
+                if entry:
+                    self._json(200, {"status": entry["status"], "error": entry.get("error") or ""})
+                else:
+                    self._json(404, {"status": "absent"})
+            elif path == "/review":
+                q = self._query()
+                entry = entry_for(q.get("pr", ""))
+                hid = q.get("id", "")
+                if not entry or entry["status"] != "done":
+                    self._json(404, {"status": "absent"})
+                    return
+                with lock:
+                    stored = store.get(entry["key"], {})
+                    r = (stored.get("reviews") or {}).get(hid)
+                self._json(200, r) if r else self._json(404, {"status": "absent"})
+            elif path == "/report":
+                entry = entry_for(self._query().get("pr", ""))
+                if entry and entry["status"] == "done":
+                    self._send(200, "text/html; charset=utf-8", entry["html"].encode("utf-8"))
+                else:
+                    self._send(404, "text/plain; charset=utf-8", b"no report for that PR")
+            elif path == "/":
+                with lock:
+                    entries = [dict(key=k, status=v["status"], title=v.get("title", ""),
+                                    url=v.get("url", ""), hunks=v.get("hunks", 0),
+                                    error=v.get("error", ""), saved=v.get("saved", ""))
+                               for k, v in store.items()]
+                self._send(200, "text/html; charset=utf-8",
+                           build_index_html(entries).encode("utf-8"))
+            else:
+                self._send(404, "text/plain; charset=utf-8", b"not found")
+
+        def do_POST(self):
+            if not self._host_ok():
+                self._send(403, "text/plain; charset=utf-8", b"forbidden")
+                return
+            path = urllib.parse.urlsplit(self.path).path.rstrip("/")
+            if path == "/triage":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(4096)
+                ref = (body or {}).get("pr", "")
+                got = try_parse_pr_ref(str(ref))
+                if not got:
+                    self._json(400, {"error": f"can't parse PR reference: {str(ref)[:100]!r}"})
+                    return
+                repo, num = got
+                key = f"{repo.lower()}#{num}"
+                with lock:
+                    cur = store.get(key)
+                    if cur and cur["status"] in ("queued", "running"):
+                        self._json(202, {"status": cur["status"]})
+                        return
+                    if cur and cur["status"] == "done" and not (body or {}).get("force"):
+                        self._json(200, {"status": "done"})
+                        return
+                    store[key] = {"status": "queued", "title": "", "url": "",
+                                  "hunks": 0, "payload": None, "html": "", "error": ""}
+                    evict_locked()
+                try:
+                    jobs.put_nowait((key, repo, num))
+                except queue.Full:
+                    with lock:
+                        store.pop(key, None)
+                    self._json(503, {"error": "triage queue full — retry later"})
+                    return
+                self._json(202, {"status": "queued"})
+            elif path == "/review":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(4096)
+                key = canon_pr_key(str((body or {}).get("pr", "")))
+                hid = str((body or {}).get("id", ""))
+                if not key or not re.match(r"^H\d+n?$", hid):
+                    self._json(400, {"error": "bad review request"})
+                    return
+                with lock:
+                    entry = store.get(key)
+                    if not entry or entry["status"] != "done":
+                        self._json(404, {"status": "absent"})
+                        return
+                    cur = (entry.get("reviews") or {}).get(hid)
+                    if cur and cur.get("status") in ("queued", "running", "done"):
+                        self._json(202 if cur["status"] != "done" else 200,
+                                   {"status": cur["status"]})
+                        return
+                    entry.setdefault("reviews", {})[hid] = {"status": "running"}
+                threading.Thread(target=review_job, args=(key, hid), daemon=True).start()
+                self._json(202, {"status": "running"})
+            elif path == "/chat":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(256 * 1024)
+                key = canon_pr_key(str((body or {}).get("pr", "")))
+                msgs = (body or {}).get("messages")
+                if not key or not isinstance(msgs, list) or not msgs:
+                    self._json(400, {"error": "bad chat request"})
+                    return
+                msgs = [m for m in msgs if isinstance(m, dict)
+                        and m.get("role") in ("user", "assistant")
+                        and isinstance(m.get("text"), str)][-20:]
+                with lock:
+                    entry = store.get(key)
+                    if not entry or entry["status"] != "done":
+                        self._json(404, {"status": "absent"})
+                        return
+                    payload = entry["payload"]
+                    hid = str((body or {}).get("id") or "")
+                    hunk, fthreads = None, []
+                    if hid:
+                        hunk = next((h for h in payload["hunks"] if h.get("id") == hid), None)
+                        if hunk is None:
+                            self._json(400, {"error": "unknown hunk"})
+                            return
+                        fthreads = [c for c in (payload.get("comments") or [])
+                                    if c.get("path") == hunk.get("file")]
+                    prompt = build_chat_prompt(payload, hunk, fthreads, msgs)
+                with review_sem:
+                    workdir = tempfile.mkdtemp(prefix="pr-triage-chat-")
+                    try:
+                        reply, cost = run_claude_text(prompt, opts, workdir)
+                        eprint(C.dim(f"chat {key}{' ' + hid if hid else ''}: ${cost:.4f}"))
+                        self._json(200, {"reply": reply.strip()[:8000]})
+                    except Exception as e:  # surface chat errors, keep daemon alive
+                        self._json(502, {"error": str(e)[:300]})
+                    finally:
+                        shutil.rmtree(workdir, ignore_errors=True)
+            elif path == "/reword":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(16 * 1024)
+                key = canon_pr_key(str((body or {}).get("pr", "")))
+                text = str((body or {}).get("text", "")).strip()
+                if not key or not (1 <= len(text) <= 4000):
+                    self._json(400, {"error": "bad reword request"})
+                    return
+                prompt = (
+                    "Reword the following code-review comment so it reads like a "
+                    "thoughtful human reviewer wrote it: plain language, simpler terms, "
+                    "direct and collegial. Keep every technical point and any line or "
+                    "identifier references exactly. No filler, no bullet lists, at most "
+                    "3 short sentences. Reply with ONLY the reworded comment text.\n\n"
+                    "=== COMMENT ===\n" + text)
+                with review_sem:
+                    workdir = tempfile.mkdtemp(prefix="pr-triage-reword-")
+                    try:
+                        reworded, cost = run_claude_text(prompt, opts, workdir)
+                        eprint(C.dim(f"reword on {key}: ${cost:.4f}"))
+                        self._json(200, {"reword": reworded.strip()[:4000]})
+                    except Exception as e:  # surface, keep daemon alive
+                        self._json(502, {"error": str(e)[:300]})
+                    finally:
+                        shutil.rmtree(workdir, ignore_errors=True)
+            elif path == "/post_comment":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(80 * 1024)
+                key = canon_pr_key(str((body or {}).get("pr", "")))
+                hid = str((body or {}).get("id", ""))
+                text = str((body or {}).get("body", "")).strip()
+                try:
+                    line = int((body or {}).get("line"))
+                except (TypeError, ValueError):
+                    line = 0
+                if not key or not re.match(r"^H\d+n?$", hid) or not (1 <= line <= 1000000) \
+                        or not (1 <= len(text) <= 60000):
+                    self._json(400, {"error": "bad comment request"})
+                    return
+                with lock:
+                    entry = store.get(key)
+                    hunk = None
+                    if entry and entry["status"] == "done":
+                        hunk = next((h for h in entry["payload"]["hunks"]
+                                     if h.get("id") == hid), None)
+                if hunk is None:
+                    self._json(404, {"status": "absent"})
+                    return
+                fpath = str(hunk.get("file") or "").split(" -> ")[-1]
+                repo, num = key.rsplit("#", 1)
+                try:
+                    sha = json.loads(run_gh(
+                        ["pr", "view", num, "--repo", repo, "--json", "headRefOid"]))["headRefOid"]
+                    out = run_gh(["api", f"repos/{repo}/pulls/{num}/comments",
+                                  "-f", f"body={text}", "-f", f"commit_id={sha}",
+                                  "-f", f"path={fpath}", "-F", f"line={line}",
+                                  "-f", "side=RIGHT"])
+                    created = json.loads(out) or {}
+                    eprint(C.bold_green(f"posted review comment on {key} {fpath}:{line}"))
+                    self._json(200, {"ok": True, "url": str(created.get("html_url") or ""),
+                                     "comment_id": created.get("id")})
+                except (ToolError, json.JSONDecodeError, KeyError, TypeError) as e:
+                    self._json(502, {"error": str(e)[:400]})
+            elif path == "/post_reply":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(80 * 1024)
+                key = canon_pr_key(str((body or {}).get("pr", "")))
+                text = str((body or {}).get("body", "")).strip()
+                try:
+                    cid = int((body or {}).get("reply_to_id"))
+                except (TypeError, ValueError):
+                    cid = 0
+                if not key or cid <= 0 or not (1 <= len(text) <= 60000):
+                    self._json(400, {"error": "bad reply request"})
+                    return
+                repo, num = key.rsplit("#", 1)
+                try:
+                    out = run_gh(["api", f"repos/{repo}/pulls/{num}/comments/{cid}/replies",
+                                  "-f", f"body={text}"])
+                    created = json.loads(out) or {}
+                    eprint(C.bold_green(f"posted reply to comment {cid} on {key}"))
+                    self._json(200, {"ok": True, "url": str(created.get("html_url") or ""),
+                                     "comment_id": created.get("id")})
+                except (ToolError, json.JSONDecodeError, TypeError) as e:
+                    self._json(502, {"error": str(e)[:400]})
+            elif path == "/delete_comment":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(4096)
+                key = canon_pr_key(str((body or {}).get("pr", "")))
+                try:
+                    cid = int((body or {}).get("comment_id"))
+                except (TypeError, ValueError):
+                    cid = 0
+                if not key or cid <= 0:
+                    self._json(400, {"error": "bad delete request"})
+                    return
+                repo, _num = key.rsplit("#", 1)
+                try:
+                    run_gh(["api", "-X", "DELETE", f"repos/{repo}/pulls/comments/{cid}"])
+                except ToolError as e:
+                    self._json(502, {"error": str(e)[:400]})
+                    return
+                # drop it (and replies hanging off it) from the stored threads too
+                with lock:
+                    entry = store.get(key)
+                    if entry and entry.get("payload"):
+                        cs = entry["payload"].get("comments") or []
+                        entry["payload"]["comments"] = [
+                            c for c in cs
+                            if c.get("id") != cid and c.get("reply_to") != cid]
+                        persist_entry(key, entry)
+                eprint(C.bold_green(f"deleted review comment {cid} on {key}"))
+                self._json(200, {"ok": True})
+            elif path == "/dismiss_suggestion":
+                if self.headers.get("X-PR-Triage") != "1":
+                    self._json(403, {"error": "missing X-PR-Triage header"})
+                    return
+                body = self._body(4096)
+                key = canon_pr_key(str((body or {}).get("pr", "")))
+                hid = str((body or {}).get("id", ""))
+                kind = str((body or {}).get("kind", "comment"))
+                try:
+                    idx = int((body or {}).get("index"))
+                except (TypeError, ValueError):
+                    idx = -1
+                if not key or not re.match(r"^H\d+n?$", hid) \
+                        or kind not in ("comment", "reply") or idx < 0:
+                    self._json(400, {"error": "bad dismiss request"})
+                    return
+                with lock:
+                    entry = store.get(key)
+                    review = (entry or {}).get("reviews", {}).get(hid) if entry else None
+                    arr = (review or {}).get("comments" if kind == "comment" else "replies")
+                    if not isinstance(arr, list) or idx >= len(arr):
+                        self._json(404, {"error": "no such suggestion"})
+                        return
+                    del arr[idx]
+                    persist_entry(key, entry)
+                self._json(200, {"ok": True})
+            elif path == "/purge":
+                if self.headers.get("X-PR-Triage-Token") != token:
+                    self._json(403, {"error": "bad token"})
+                    return
+                body = self._body(4096)
+                pkey = (body or {}).get("key")
+                with lock:
+                    if pkey:
+                        pkey = canon_pr_key(str(pkey))
+                        n = 1 if pkey and store.pop(pkey, None) is not None else 0
+                        if n:
+                            delete_persisted(pkey)
+                    else:
+                        n = len(store)
+                        for k in list(store):
+                            delete_persisted(k)
+                        store.clear()
+                eprint(C.dim(f"serve: purged {n} stored triage(s)"))
+                self._json(200, {"ok": True, "purged": n})
+            elif path == "/publish":
+                if self.headers.get("X-PR-Triage-Token") != token:
+                    self._json(403, {"error": "bad token"})
+                    return
+                body = self._body(64 * 1024 * 1024)
+                key = canon_pr_key(str((body or {}).get("key", "")))
+                payload, html_doc = (body or {}).get("payload"), (body or {}).get("html")
+                if not key or not isinstance(payload, dict) or not isinstance(html_doc, str):
+                    self._json(400, {"error": "bad publish body"})
+                    return
+                with lock:
+                    store[key] = {"status": "done",
+                                  "title": (payload.get("pr") or {}).get("title") or "",
+                                  "url": (payload.get("pr") or {}).get("url") or "",
+                                  "hunks": len(payload.get("hunks") or []),
+                                  "payload": payload, "html": html_doc, "error": "",
+                                  "saved": time.strftime("%Y-%m-%d %H:%M")}
+                    persist_entry(key, store[key])
+                    evict_locked()
+                eprint(C.dim(f"serve: accepted published triage for {key}"))
+                auto_review(key)
+                self._json(200, {"status": "done"})
+            else:
+                self._send(404, "text/plain; charset=utf-8", b"not found")
+
+        def log_message(self, fmt, *args):
+            if opts.verbose:
+                eprint(C.dim(f"serve: {fmt % args}"))
+
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        raise ToolError(f"cannot serve on 127.0.0.1:{port}: {e}", 1)
+    start_log_file()
+    threading.Thread(target=worker, daemon=True).start()
+    prior = read_serve_state()
+    if prior and prior.get("port") not in (None, port):
+        eprint(C.yellow(f"note: replacing serve state previously owned by port {prior.get('port')} — "
+                        "`--serve` publishes now target this server"))
+    write_serve_state({"port": port, "token": token, "pid": os.getpid()})
+    def _on_term(*_args):
+        raise KeyboardInterrupt
+
+    try:
+        import signal
+        signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        pass  # not the main thread / unsupported platform: stale state file is harmless
+    eprint()
+    eprint(C.bold(f"pr-triage server on http://127.0.0.1:{port}"))
+    eprint(f"  · dashboard:     http://127.0.0.1:{port}/")
+    eprint(f"  · overlay json:  http://127.0.0.1:{port}/triage.json?pr=<owner/repo%23N>")
+    eprint(C.dim("  add PRs from the dashboard, the GitHub overlay button, or `pr-triage <pr> --serve`"))
+    eprint(C.dim("  Ctrl-C to stop"))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        eprint("\nserve stopped")
+    finally:
+        server.server_close()
+        try:
+            st = read_serve_state()
+            # only remove the state file if this daemon still owns it
+            if st and st.get("pid") == os.getpid() and st.get("port") == port:
+                os.remove(SERVE_STATE_PATH)
+        except OSError:
+            pass
+
+
+def publish_to_daemon(port: int, key: str, payload: dict, html_doc: str) -> bool:
+    """Push a finished triage into an already-running daemon. True on success."""
+    state = read_serve_state()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as resp:
+            if json.load(resp).get("app") != "pr-triage":
+                return False
+    except (OSError, ValueError):
+        return False
+    if not state or state.get("port") != port or not state.get("token"):
+        raise ToolError(f"a pr-triage server is on port {port} but its state file is missing/stale "
+                        f"({SERVE_STATE_PATH}) — restart it with `pr-triage serve`", 1)
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/publish", method="POST",
+        data=json.dumps({"key": key, "payload": payload, "html": html_doc}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-PR-Triage-Token": state["token"]},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status == 200
+    except OSError as e:
+        raise ToolError(f"publishing to the running pr-triage server failed: {e}", 1)
+
+
+def serve_or_publish(port: int, key: str, payload: dict, html_doc: str, opts):
+    """Start the daemon seeded with this result, or publish into a running one."""
+    try:
+        daemon_serve(port, opts, [(key, payload, html_doc)])
+    except ToolError:
+        try:
+            published = publish_to_daemon(port, key, payload, html_doc)
+        except ToolError as e:
+            die(str(e), e.code)
+        if published:
+            eprint(C.bold_green(
+                f"published {key} to the running pr-triage server (http://127.0.0.1:{port}/)"))
+        else:
+            die(f"port {port} is in use by something that isn't a pr-triage server — "
+                f"stop it or pass a different --serve PORT", 1)
+
+
+SUBCOMMAND_HELP = """
+subcommands (in place of a PR reference):
+  serve                 run the triage server: dashboard at http://127.0.0.1:8642/,
+                        feeds the GitHub Triage-tab userscript, queues new PRs from
+                        the dashboard/overlay, persists results across restarts
+  logs [-n N] [-f]      show (or follow) the server log at ~/.local/state/pr-triage/serve.log
+  purge [PR] [--yes]    delete one stored triage, or all of them; goes through the
+                        running server when one is up so UI and disk stay in sync
+  help                  this help
+
+typical flow:
+  1. pr-triage serve                       # once, leave it running
+  2. open a PR's 'Files changed' on GitHub # Triage tab appears (userscript v2.5+)
+  3. click 'Triage this PR', then review from the Triage tab: scores, notes,
+     inline diffs, deep reviews, chat, and posting comments — all in one place
+"""
+
+
+def logs_cmd(opts) -> int:
+    """`pr-triage logs [-n N] [-f]` — show the serve daemon's log."""
+    if not os.path.exists(LOG_PATH):
+        eprint(C.yellow(f"no server log yet ({LOG_PATH}) — it is written by `pr-triage serve`"))
+        return 1
+    with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    for ln in lines[-max(1, opts.lines):]:
+        print(ln.rstrip("\n"))
+    if opts.follow:
+        try:
+            with open(LOG_PATH, encoding="utf-8", errors="replace") as fh:
+                fh.seek(0, os.SEEK_END)
+                while True:
+                    ln = fh.readline()
+                    if ln:
+                        print(ln.rstrip("\n"), flush=True)
+                    else:
+                        time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+    return 0
+
+
+def purge_cmd(opts) -> int:
+    """`pr-triage purge [pr] [--yes]` — delete stored triages (one PR or all)."""
+    key = None
+    if opts.target:
+        key = canon_pr_key(opts.target)
+        if not key:
+            die(f"can't parse PR reference for purge: {opts.target!r}", 2)
+    label = key or "ALL stored triages"
+    if not opts.yes:
+        if not sys.stdin.isatty():
+            die("purge needs --yes when not run interactively", 2)
+        ans = input(f"purge {label}? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            eprint("aborted")
+            return 1
+    # if a daemon is running, purge through it so memory and disk stay in sync
+    state = read_serve_state()
+    if state and state.get("port") and state.get("token"):
+        daemon_up = False
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{state['port']}/health", timeout=3) as resp:
+                daemon_up = json.load(resp).get("app") == "pr-triage"
+        except (OSError, ValueError):
+            pass
+        if daemon_up:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{state['port']}/purge", method="POST",
+                data=json.dumps({"key": key}).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "X-PR-Triage-Token": state["token"]})
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    n = json.load(resp).get("purged", 0)
+            except (OSError, ValueError) as e:
+                die(f"purge via the running server failed: {e} "
+                    "(old server build? restart `pr-triage serve` and retry)", 1)
+            eprint(C.bold_green(f"purged {n} triage(s) from the running server"))
+            return 0
+    # no daemon: clean the datastore directly
+    n = 0
+    if key:
+        path = _persist_path(key)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                n = 1
+            except OSError as e:
+                die(f"could not remove {path}: {e}", 1)
+    else:
+        try:
+            for name in os.listdir(STORE_DIR):
+                if name.endswith(".json"):
+                    os.remove(os.path.join(STORE_DIR, name))
+                    n += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            die(f"could not purge {STORE_DIR}: {e}", 1)
+    eprint(C.bold_green(f"purged {n} stored triage(s) from {STORE_DIR}"))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="pr-triage",
+        description="Prioritize a GitHub PR's diff for human review using local Claude.",
+        epilog="PR reference forms: https://github.com/owner/repo/pull/N · owner/repo#N · N --repo owner/repo",
+    )
+    p.add_argument("pr", help="PR URL, owner/repo#N, bare number with --repo — or a "
+                              "subcommand: 'serve' (run the triage server), 'logs' "
+                              "(show server logs), 'purge' (delete stored triages)")
+    p.add_argument("target", nargs="?",
+                   help="for 'purge': the PR to purge (omit to purge everything)")
+    p.add_argument("-n", "--lines", type=int, default=100, metavar="N",
+                   help="for 'logs': number of trailing lines to show (default 100)")
+    p.add_argument("-f", "--follow", action="store_true",
+                   help="for 'logs': keep following new log lines (Ctrl-C to stop)")
+    p.add_argument("--yes", action="store_true",
+                   help="for 'purge': skip the confirmation prompt")
+    p.add_argument("--repo", help="owner/name (for bare PR numbers)")
+    p.add_argument("--model", help="model passed to `claude --model` (default: your claude default)")
+    p.add_argument("--top", type=int, metavar="N", help="show only the top N hunks in the detailed diff view")
+    p.add_argument("--min-score", type=int, default=0, metavar="PCT",
+                   help="hide hunks below this importance in the detailed view (default 0)")
+    p.add_argument("--batch-chars", type=int, default=60000, metavar="N",
+                   help="max prompt chars per claude call (default 60000)")
+    p.add_argument("--parallel", type=int, default=2, metavar="N",
+                   help="concurrent claude calls (default 2; use 1 for slow local models)")
+    p.add_argument("--timeout", type=int, default=600, metavar="SECS",
+                   help="per-call timeout (default 600)")
+    p.add_argument("--auto-review", type=int, default=12, metavar="N",
+                   help="serve: after each triage, pre-generate deep reviews for the top N "
+                        "hunks at or above --auto-review-min, so 'Review this diff' is "
+                        "instant for them (0 disables; default 12)")
+    p.add_argument("--auto-review-min", type=int, default=50, metavar="PCT",
+                   help="serve: importance threshold for auto deep-reviews (default 50)")
+    p.add_argument("--no-heuristics", action="store_true",
+                   help="send lockfiles/generated/binary changes to the model too")
+    p.add_argument("--json", metavar="PATH", help="also write a JSON report")
+    p.add_argument("--html", metavar="PATH", help="also write a self-contained HTML report")
+    p.add_argument("--serve", nargs="?", const=8642, type=int, metavar="PORT",
+                   help="after scoring, start the triage server on 127.0.0.1 (default port "
+                        "8642) — or publish this result into an already-running one. The "
+                        "server hosts a dashboard, HTML reports, and the overlay JSON, and "
+                        "accepts more PRs from the dashboard or the GitHub overlay button")
+    p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    p.add_argument("--claude-bin", default="claude", help="claude executable (default: claude)")
+    p.add_argument("--claude-arg", action="append", metavar="ARG",
+                   help="extra args passed through to claude, shell-style split "
+                        "(repeatable; use = for flag-like values: --claude-arg=--verbose, "
+                        "--claude-arg '--effort low')")
+    p.add_argument("--dry-run", action="store_true",
+                   help="parse + batch only; print what would be sent, don't call claude")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main(argv=None) -> int:
+    opts = build_arg_parser().parse_args(argv)
+    if opts.no_color or os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        C.enabled = False
+    if os.sep in opts.claude_bin:
+        # claude runs from a temp cwd; keep relative binary paths working
+        opts.claude_bin = os.path.abspath(opts.claude_bin)
+    if opts.top is not None and opts.top < 0:
+        die("--top must be >= 0", 2)
+    # fail fast on unwritable report paths, before any gh/claude work
+    for flag, p in (("--json", opts.json), ("--html", opts.html)):
+        if p:
+            if os.path.isdir(p):
+                die(f"{flag} path is a directory: {p}", 2)
+            parent = os.path.dirname(os.path.abspath(p))
+            if not os.path.isdir(parent):
+                die(f"{flag} parent directory does not exist: {parent}", 2)
+
+    cmd = opts.pr.strip().lower()
+    if cmd == "help":
+        build_arg_parser().print_help()
+        print(SUBCOMMAND_HELP)
+        return 0
+    if cmd == "logs":
+        return logs_cmd(opts)
+    if cmd == "purge":
+        return purge_cmd(opts)
+    if opts.target:
+        die(f"unexpected extra argument: {opts.target!r}", 2)
+    if cmd == "serve":
+        # daemon mode: start empty; PRs are added from the dashboard, the
+        # overlay's "Triage this PR" button, or `pr-triage <pr> --serve` runs
+        try:
+            daemon_serve(opts.serve if opts.serve is not None else 8642, opts, [])
+        except ToolError as e:
+            die(str(e), e.code)
+        return 0
+
+    repo, num = parse_pr_ref(opts.pr, opts.repo)
+    pr_key = f"{repo.lower()}#{num}"
+    t0 = time.time()
+    try:
+        meta, files, all_hunks, to_score, warnings = prepare_triage(repo, num, opts)
+    except ToolError as e:
+        die(str(e), e.code)
+    if not files:
+        eprint(C.yellow("PR diff is empty — nothing to triage"))
+        if opts.json:
+            write_json_report(opts.json, meta, [], opts, 0.0)
+        if opts.html:
+            write_html_report(opts.html, meta, [], opts)
+        if opts.serve is not None:
+            serve_or_publish(opts.serve, pr_key, build_report_doc(meta, [], opts, 0.0),
+                             render_html(meta, [], opts), opts)
+        return 0
+
+    if opts.dry_run:
+        batches = batch_hunks(to_score, opts.batch_chars)
+        print(f"{len(files)} files, {len(all_hunks)} hunks "
+              f"({len(to_score)} to score, {len(all_hunks) - len(to_score)} heuristic)")
+        for i, b in enumerate(batches, 1):
+            prompt = build_prompt(meta, b)
+            print(f"  batch {i}: {len(b)} hunks, {len(prompt)} prompt chars")
+        return 0
+
+    try:
+        total_cost = score_hunks(to_score, meta, opts, warnings)
+    except ClaudeError as e:
+        die(str(e), 4)
+
+    elapsed = time.time() - t0
+    render_terminal(meta, files, all_hunks, opts, elapsed, total_cost, warnings)
+
+    rc = 0
+    if opts.json:
+        try:
+            write_json_report(opts.json, meta, all_hunks, opts, total_cost)
+            eprint(C.dim(f"json report: {opts.json}"))
+        except OSError as e:
+            eprint(C.red(f"pr-triage: failed to write json report {opts.json!r}: {e}"))
+            rc = 1
+    if opts.html:
+        try:
+            write_html_report(opts.html, meta, all_hunks, opts)
+            eprint(C.dim(f"html report: {opts.html}"))
+        except OSError as e:
+            eprint(C.red(f"pr-triage: failed to write html report {opts.html!r}: {e}"))
+            rc = 1
+    if opts.serve is not None:
+        serve_or_publish(opts.serve, pr_key, build_report_doc(meta, all_hunks, opts, total_cost),
+                         render_html(meta, all_hunks, opts), opts)
+    return rc
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        eprint("\ninterrupted")
+        sys.exit(130)
