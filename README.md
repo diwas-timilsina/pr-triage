@@ -10,6 +10,8 @@ scoring (whatever backend your shell configures — Anthropic login, Bedrock, or
 a local model via `ANTHROPIC_BASE_URL`), and a localhost daemon serves the
 results. Nothing leaves your machine except comments you explicitly post.
 
+![The Triage tab on a GitHub PR](docs/triage-ui.png)
+
 ## Install
 
 ```bash
@@ -68,6 +70,48 @@ grants CORS solely to `https://github.com`, requires a CSRF header on state-
 changing endpoints, and gates CLI-to-daemon calls (publish/purge) behind a
 0600 token file. The userscript treats everything the local port serves as
 untrusted: payloads are shape-validated and rendered via textContent only.
+
+## Troubleshooting claude issues
+
+pr-triage runs `claude -p` as a subprocess and inherits your shell's
+environment, so almost every failure is really a `claude` setup issue.
+First check both of these — they must work in the same shell/state the
+server runs in:
+
+```bash
+claude auth status        # loggedIn should be true (or a backend env var set)
+pr-triage logs -n 30      # server-side errors land here
+```
+
+**`API Error: Unable to connect … (ConnectionRefused)`** — your shell points
+`claude` at a local/proxy backend that isn't running. Check for
+`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` in `env | grep ANTHROPIC` and in
+`~/.zshrc` (e.g. an LM Studio experiment on `localhost:1234`). Either start
+that server, or remove the exports and run `claude /login`. Two gotchas:
+editing `~/.zshrc` does **not** fix already-open terminals (run
+`unset ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN` or open a new tab), and the
+daemon captures its environment at startup — restart `pr-triage serve` after
+fixing.
+
+**`Not logged in · Please run /login`** — the CLI has no credentials in this
+context: `claude /login` once, then restart the server.
+
+**Scoring hangs or times out** — local models are slow; try
+`pr-triage serve --parallel 1 --timeout 1200`, and smaller batches via
+`--batch-chars 30000`.
+
+**`model output unparseable after retry`** — the model isn't returning valid
+JSON (each call already gets one automatic retry). Usually a too-small local
+model; try `--model sonnet` or a larger local model.
+
+**Running inside a Claude Code session** — pr-triage strips the nested-session
+markers (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SSE_PORT`)
+automatically, but keeps auth/backend vars like `CLAUDE_CODE_OAUTH_TOKEN` and
+`CLAUDE_CODE_USE_BEDROCK` intact.
+
+**Isolate the model entirely** — run against the bundled stub to prove the
+rest of the pipeline works: `pr-triage owner/repo#1 --claude-bin ./stub_claude`.
+If that succeeds, the problem is your `claude` setup, not pr-triage.
 
 ## Development
 
